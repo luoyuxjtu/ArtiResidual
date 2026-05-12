@@ -22,11 +22,13 @@ from artiresidual.refiner.analytical_flow import (
     constraint_directions,
     normalize_axis,
 )
+from artiresidual.refiner.state_estimator import JointStateEstimator
 
 __all__ = [
     "JOINT_TYPE_FIXED",
     "JOINT_TYPE_PRISMATIC",
     "JOINT_TYPE_REVOLUTE",
+    "JointStateEstimator",
     "analytical_flow",
     "analytical_flow_batched",
     "analytical_flow_diff",
