@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ArtiResidual Pipeline (Self-Correction Loop 为中心)</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif; margin: 0; padding: 24px; background: #FAFAF7; color: #1A1915; }
+  .container { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 8px; }
+  h2 { font-size: 18px; margin-top: 32px; margin-bottom: 12px; color: #1A1915; }
+  .subtitle { color: #62605B; font-size: 14px; margin-bottom: 24px; line-height: 1.5; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; padding: 16px; background: #FFF; border-radius: 8px; border: 1px solid #E8E6E1; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .legend-swatch { width: 16px; height: 16px; border-radius: 3px; border: 0.5px solid rgba(0,0,0,0.1); }
+  .note { background: #FFF; border-left: 3px solid #C44E63; padding: 12px 16px; margin: 16px 0; border-radius: 4px; font-size: 14px; line-height: 1.6; }
+  text { fill: #1A1915; }
+  .th { font: 600 13px -apple-system, "PingFang SC", sans-serif; }
+  .ts { font: 11px -apple-system, "PingFang SC", sans-serif; fill: #4A4843; }
+  .tlabel { font: 600 11px -apple-system, "PingFang SC", sans-serif; }
+  .badge { font: 700 12px -apple-system, "PingFang SC", sans-serif; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>ArtiResidual Pipeline — Self-Correction Loop 为中心</h1>
+<p class="subtitle">所有模块的存在都是为了支撑中心的 <b>Self-Correction Loop</b>。这是 paper 的灵魂——其它模块只是 implementation。</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#FBE0E5"></div>Self-correction loop (核心机制)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#E0D7F0"></div>感知 (frozen)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#CFE4E0"></div>角色分配</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#FBE5C0"></div>State estimator</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#D8C9F0"></div>DiT Policy</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#EFEDE7"></div>Frozen / hand-coded</div>
+</div>
+
+<svg width="100%" viewBox="0 0 880 1100" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#62605B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+<marker id="arr-loop" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#C44E63" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+<marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#185FA5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<!-- ============ TOP: One-time initialization ============ -->
+<text class="th" x="40" y="32">一次性初始化 (任务开始时, t=0)</text>
+
+<rect x="40" y="48" width="220" height="56" rx="8" fill="#EFEDE7" stroke="#C5C2BC" stroke-width="0.8"/>
+<text class="th" x="150" y="68" text-anchor="middle">初始观测</text>
+<text class="ts" x="150" y="86" text-anchor="middle">RGB-D + 点云</text>
+<text class="ts" x="150" y="98" text-anchor="middle">articulated object</text>
+
+<rect x="290" y="48" width="240" height="56" rx="8" fill="#E0D7F0" stroke="#9B8AC8" stroke-width="0.8"/>
+<text class="th" x="410" y="68" text-anchor="middle">Articulation Estimator (frozen)</text>
+<text class="ts" x="410" y="86" text-anchor="middle">FlowBot3D-style point cloud net</text>
+<text class="ts" x="410" y="98" text-anchor="middle">→ 粗糙先验 (ω, p, type) for K parts</text>
+
+<rect x="560" y="48" width="280" height="56" rx="8" fill="#CFE4E0" stroke="#5BA396" stroke-width="0.8"/>
+<text class="th" x="700" y="68" text-anchor="middle">Stabilizer-Actor Selector</text>
+<text class="ts" x="700" y="86" text-anchor="middle">分配双臂角色 + 抓取位姿 + 时序</text>
+<text class="ts" x="700" y="98" text-anchor="middle">(借鉴 VoxAct-B, 不是 contribution)</text>
+
+<line x1="260" y1="76" x2="285" y2="76" stroke="#62605B" stroke-width="1.2" marker-end="url(#arr)"/>
+<line x1="530" y1="76" x2="555" y2="76" stroke="#62605B" stroke-width="1.2" marker-end="url(#arr)"/>
+
+<!-- Initialize K=3 hypotheses -->
+<rect x="40" y="124" width="800" height="40" rx="8" fill="#FFF8DC" stroke="#D49A3F" stroke-width="0.8"/>
+<text class="ts" x="440" y="148" text-anchor="middle">初始化 K=3 hypotheses: {h₁=revolute-vertical, h₂=revolute-horizontal, h₃=prismatic} 各带粗糙 (ω, p) 估计 + 初始权重</text>
+
+<line x1="700" y1="104" x2="700" y2="120" stroke="#62605B" stroke-width="1.2" marker-end="url(#arr)"/>
+
+<!-- ============ MIDDLE: SELF-CORRECTION LOOP (CENTRAL) ============ -->
+<text class="badge" x="40" y="200" fill="#993556">★ Self-Correction Loop (核心机制) — 每 N=10 个 timestep 执行</text>
+
+<rect x="20" y="218" width="840" height="500" rx="14" fill="#FBE0E5" stroke="#993556" stroke-width="2.5"/>
+
+<!-- Loop step 1: PREDICT -->
+<rect x="40" y="244" width="180" height="100" rx="8" fill="#FFFFFF" stroke="#C44E63" stroke-width="1.5"/>
+<text class="th" x="130" y="266" text-anchor="middle">① Predict</text>
+<text class="ts" x="130" y="288" text-anchor="middle">从当前 hypothesis 集</text>
+<text class="ts" x="130" y="304" text-anchor="middle">{(ωₖ, pₖ, typeₖ, wₖ)}</text>
+<text class="ts" x="130" y="320" text-anchor="middle">+ 当前 θ_t</text>
+<text class="ts" x="130" y="336" text-anchor="middle">→ f_analytical (加权)</text>
+
+<!-- Loop step 2: OBSERVE -->
+<rect x="240" y="244" width="180" height="100" rx="8" fill="#FFFFFF" stroke="#C44E63" stroke-width="1.5"/>
+<text class="th" x="330" y="266" text-anchor="middle">② Observe</text>
+<text class="ts" x="330" y="288" text-anchor="middle">当前点云</text>
+<text class="ts" x="330" y="304" text-anchor="middle">→ Run-time perception</text>
+<text class="ts" x="330" y="320" text-anchor="middle">→ f_predicted (per-point)</text>
+<text class="ts" x="330" y="336" text-anchor="middle">+ wrench reading</text>
+
+<!-- Loop step 3: COMPARE -->
+<rect x="440" y="244" width="180" height="100" rx="8" fill="#FFFFFF" stroke="#C44E63" stroke-width="2"/>
+<text class="th" x="530" y="266" text-anchor="middle">③ Compute Residual</text>
+<text class="ts" x="530" y="288" text-anchor="middle" font-weight="600" fill="#993556">Δ_flow = f_predicted</text>
+<text class="ts" x="530" y="304" text-anchor="middle" font-weight="600" fill="#993556">  − f_analytical(θ_t)</text>
+<text class="ts" x="530" y="320" text-anchor="middle">+ wrench residual</text>
+<text class="ts" x="530" y="336" text-anchor="middle">→ evidence vector</text>
+
+<!-- Loop step 4: REFINE -->
+<rect x="640" y="244" width="200" height="100" rx="8" fill="#FFFFFF" stroke="#C44E63" stroke-width="1.5"/>
+<text class="th" x="740" y="266" text-anchor="middle">④ Refine Belief (IMM)</text>
+<text class="ts" x="740" y="288" text-anchor="middle">Transformer encoder</text>
+<text class="ts" x="740" y="304" text-anchor="middle">→ updated wₖ + Δμₖ</text>
+<text class="ts" x="740" y="320" text-anchor="middle">→ refined</text>
+<text class="ts" x="740" y="336" text-anchor="middle">{(ωₖ', pₖ', typeₖ, wₖ')}</text>
+
+<!-- Loop arrows -->
+<line x1="220" y1="294" x2="238" y2="294" stroke="#C44E63" stroke-width="1.8" marker-end="url(#arr-loop)"/>
+<line x1="420" y1="294" x2="438" y2="294" stroke="#C44E63" stroke-width="1.8" marker-end="url(#arr-loop)"/>
+<line x1="620" y1="294" x2="638" y2="294" stroke="#C44E63" stroke-width="1.8" marker-end="url(#arr-loop)"/>
+
+<!-- Loop back arrow (refine -> predict) -->
+<path d="M 740 344 Q 740 380 440 380 Q 130 380 130 344" fill="none" stroke="#C44E63" stroke-width="2.2" stroke-dasharray="4 3" marker-end="url(#arr-loop)"/>
+<text class="ts" x="440" y="395" text-anchor="middle" fill="#993556" font-weight="600">下一个 N timestep</text>
+
+<!-- Belief output -->
+<rect x="180" y="430" width="520" height="60" rx="8" fill="#F8C9CC" stroke="#993556" stroke-width="2"/>
+<text class="th" x="440" y="454" text-anchor="middle">f_cond(t) = Σₖ wₖ · f_analytical(ωₖ, pₖ, typeₖ, θ_t)</text>
+<text class="ts" x="440" y="474" text-anchor="middle">probability-weighted analytical flow → 注入 DiT policy 作为 conditioning token</text>
+
+<line x1="740" y1="344" x2="600" y2="426" stroke="#993556" stroke-width="1.5" marker-end="url(#arr-loop)"/>
+
+<!-- Annotations -->
+<text class="ts" x="440" y="525" text-anchor="middle" fill="#62605B" font-style="italic">论证: 因为 stabilizer 臂物理上隔离了 articulation 运动，</text>
+<text class="ts" x="440" y="542" text-anchor="middle" fill="#62605B" font-style="italic">观测到的 f_predicted 是干净的 evidence (没有混入"整体被推走"的 noise)，</text>
+<text class="ts" x="440" y="559" text-anchor="middle" fill="#62605B" font-style="italic">因此 Δ_flow 才能作为 belief refinement 的可靠 evidence。</text>
+<text class="ts" x="440" y="576" text-anchor="middle" fill="#993556" font-weight="600">→ 这就是为什么 self-correction 在 bimanual 下才物理可行。</text>
+
+<!-- Inputs to the loop -->
+<text class="tlabel" x="440" y="616" text-anchor="middle" fill="#62605B">辅助输入到 ④ Refiner:</text>
+
+<rect x="80" y="630" width="180" height="62" rx="6" fill="#FBE5C0" stroke="#D49A3F" stroke-width="0.8"/>
+<text class="th" x="170" y="652" text-anchor="middle">State Estimator</text>
+<text class="ts" x="170" y="670" text-anchor="middle">从 part pose 反推 θ_t</text>
+<text class="ts" x="170" y="684" text-anchor="middle">每帧更新</text>
+
+<rect x="290" y="630" width="180" height="62" rx="6" fill="#EFEDE7" stroke="#C5C2BC" stroke-width="0.8"/>
+<text class="th" x="380" y="652" text-anchor="middle">力觉 wrench 缓冲</text>
+<text class="ts" x="380" y="670" text-anchor="middle">stabilizer 臂的 6-DoF 力</text>
+<text class="ts" x="380" y="684" text-anchor="middle">+ actor 臂的 6-DoF 力</text>
+
+<rect x="500" y="630" width="180" height="62" rx="6" fill="#EFEDE7" stroke="#C5C2BC" stroke-width="0.8"/>
+<text class="th" x="590" y="652" text-anchor="middle">Action 历史</text>
+<text class="ts" x="590" y="670" text-anchor="middle">最近 30 步双臂动作</text>
+<text class="ts" x="590" y="684" text-anchor="middle">作为 context</text>
+
+<line x1="170" y1="630" x2="170" y2="346" stroke="#62605B" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+<line x1="380" y1="630" x2="530" y2="346" stroke="#62605B" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+<line x1="590" y1="630" x2="740" y2="346" stroke="#62605B" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+
+<!-- ============ BOTTOM: Policy + Action ============ -->
+<text class="th" x="40" y="752">DiT Policy (~150M params, 可训练) — 接收 belief 作为 conditioning</text>
+
+<rect x="40" y="768" width="800" height="160" rx="8" fill="#D8C9F0" stroke="#5D3D9A" stroke-width="1.2"/>
+<text class="th" x="440" y="792" text-anchor="middle">Bimanual Diffusion Transformer (DiT)</text>
+<text class="ts" x="440" y="814" text-anchor="middle">输入 conditioning tokens (concat or cross-attend, 详见下文):</text>
+<text class="ts" x="440" y="832" text-anchor="middle">★ f_cond(t) = Σₖ wₖ · f_analytical (从 self-correction loop 来)</text>
+<text class="ts" x="440" y="848" text-anchor="middle">★ uncertainty signal: H(w) (hypothesis entropy, 告诉 policy 当前 belief 多确定)</text>
+<text class="ts" x="440" y="864" text-anchor="middle">+ 点云 features · stabilizer pose · current θ_t · proprioception · wrench</text>
+<text class="th" x="440" y="894" text-anchor="middle">输出: 16-step actor 臂动作 chunk</text>
+<text class="ts" x="440" y="912" text-anchor="middle">(stabilizer 臂动作开环执行, 不在 diffusion 里)</text>
+
+<line x1="440" y1="490" x2="440" y2="765" stroke="#993556" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arr-loop)"/>
+<text class="ts" x="475" y="615" fill="#993556" font-weight="600">f_cond → policy</text>
+
+<!-- Action execution -->
+<rect x="200" y="956" width="480" height="60" rx="8" fill="#EFEDE7" stroke="#C5C2BC" stroke-width="0.8"/>
+<text class="th" x="440" y="980" text-anchor="middle">Actor 臂执行 → 物体被驱动 → 下一帧观测</text>
+<text class="ts" x="440" y="998" text-anchor="middle">点云变化 + 力反馈变化 → 下一轮 self-correction loop 见到新 evidence</text>
+
+<line x1="440" y1="928" x2="440" y2="954" stroke="#62605B" stroke-width="1.2" marker-end="url(#arr)"/>
+
+<!-- Outer feedback loop -->
+<path d="M 680 985 Q 870 985 870 540 Q 870 290 845 290" fill="none" stroke="#185FA5" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#arr-blue)"/>
+<text class="ts" x="868" y="650" text-anchor="end" fill="#185FA5" font-weight="600">外层闭环</text>
+<text class="ts" x="868" y="666" text-anchor="end" fill="#185FA5">下一帧 RGBD/wrench</text>
+
+</svg>
+
+<h2>关键观察</h2>
+<div class="note">
+<b>注意这张图和之前的最大区别:</b><br><br>
+1. <b>Self-correction loop 占据画面正中央</b>, 用红色突出标记。这是 paper 的灵魂。其它一切都围绕它布局。<br><br>
+2. <b>所有借鉴的模块 (stabilizer-actor selector / 感知 net / state estimator) 缩到角落</b>, 用淡色, 标注 "借鉴, 不是 contribution"。<br><br>
+3. <b>双臂的物理论证显式画进图里</b> (loop 下方斜体): "stabilizer 臂物理上隔离了 articulation 运动 → f_predicted 是干净的 evidence → Δ_flow 才能驱动 belief refine"。这是双臂必要性的论证。<br><br>
+4. <b>DiT policy 不是 contribution</b>, 它只是接收 belief 的 downstream 模块。
+</div>
+</div>
+</body>
+</html>
