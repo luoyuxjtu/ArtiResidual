@@ -66,9 +66,11 @@ logs/
 runs/
 
 # --- Datasets (large; keep small fixtures only in tests/fixtures/) ---
-data/
-datasets/
-demos/
+# Anchored to repo root so we don't accidentally ignore the
+# `artiresidual/data/` Python package.
+/data/
+/datasets/
+/demos/
 *.h5
 *.hdf5
 *.zarr
