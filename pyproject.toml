@@ -71,7 +71,7 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
-addopts = "-ra -q"
+addopts = "-ra"
 markers = [
     "gpu: marks a test that requires a CUDA GPU (skipped by default in codespace)",
     "sim: marks a test that requires a simulator (RoboTwin / ManiSkill) — server only",

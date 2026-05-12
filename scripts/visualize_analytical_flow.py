@@ -116,6 +116,11 @@ def main() -> None:
 
     fig = plt.figure(figsize=(12, 5.5))
 
+    # ``normalize=False`` is critical for revolute: |ω × (x - p)| scales with the
+    # in-plane distance to the hinge axis, so points farther out (x ≈ 1.0) draw
+    # ~6.7× longer arrows than points near the hinge (x ≈ 0.15). The flow itself
+    # was per-part-normalized so the longest arrow has unit data magnitude;
+    # ``length`` then sets the on-screen size of that longest arrow.
     ax = fig.add_subplot(1, 2, 1, projection="3d")
     ax.scatter(
         door[:, 0].numpy(), door[:, 1].numpy(), door[:, 2].numpy(),
@@ -124,15 +129,17 @@ def main() -> None:
     ax.quiver(
         door[:, 0].numpy(), door[:, 1].numpy(), door[:, 2].numpy(),
         flow_r[:, 0].numpy(), flow_r[:, 1].numpy(), flow_r[:, 2].numpy(),
-        length=args.arrow_length, normalize=True,
-        color="#d62728", linewidth=1.2,
+        length=args.arrow_length, normalize=False,
+        color="#d62728", linewidth=1.2, arrow_length_ratio=0.25,
     )
     ax.plot([0, 0], [0, 0], [-0.15, 1.7], color="black", linewidth=2.5, label="ω (hinge)")
     ax.set_title(f"Revolute door @ {args.theta_deg:.0f}° about +ẑ\n"
-                 f"flow = ω × (x - p)")
+                 f"flow = ω × (x - p)   (length ∝ distance to hinge)")
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.legend(loc="upper left")
 
+    # Prismatic: every flow vector is ω̂ exactly, so the arrows ARE uniform.
+    # We still pass normalize=False for consistency with the revolute panel.
     ax = fig.add_subplot(1, 2, 2, projection="3d")
     ax.scatter(
         drawer[:, 0].numpy(), drawer[:, 1].numpy(), drawer[:, 2].numpy(),
@@ -141,8 +148,8 @@ def main() -> None:
     ax.quiver(
         drawer[:, 0].numpy(), drawer[:, 1].numpy(), drawer[:, 2].numpy(),
         flow_p[:, 0].numpy(), flow_p[:, 1].numpy(), flow_p[:, 2].numpy(),
-        length=args.arrow_length, normalize=True,
-        color="#d62728", linewidth=1.2,
+        length=args.arrow_length, normalize=False,
+        color="#d62728", linewidth=1.2, arrow_length_ratio=0.25,
     )
     axis_pts_x = [-0.2 * omega_p[0].item(), 1.2 * omega_p[0].item()]
     axis_pts_y = [-0.2 * omega_p[1].item(), 1.2 * omega_p[1].item()]
