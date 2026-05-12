@@ -1,0 +1,24 @@
+# IMM articulation refiner — default K=3 hypotheses.
+# Spec §3 Module 04. ★ CORE MODULE.
+#
+# K=3 covers: {h1=revolute-vertical-axis, h2=revolute-horizontal-axis, h3=prismatic}
+# Initialized from prior estimator: top hypothesis 0.6, others 0.2 each.
+_target_: artiresidual.refiner.imm_filter.IMMArticulationRefiner
+
+K: 3
+window_T: 30
+update_interval_N: 10
+
+# Per-hypothesis encoder
+dim: 256
+n_heads: 4
+n_layers: 4
+
+# Weight dynamics
+w_min: 0.05
+lambda_H: 0.01        # entropy regularization weight
+
+# Residual application (tangent-space)
+eta: 0.5              # learning rate for residual correction
+omega_clip_deg: 30.0
+p_clip_m: 0.05

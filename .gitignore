@@ -1,0 +1,113 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual envs ---
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# --- Test / lint caches ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- wandb ---
+wandb/
+.wandb/
+wandb_local/
+
+# --- Hydra / experiment outputs ---
+outputs/
+multirun/
+hydra_outputs/
+logs/
+runs/
+
+# --- Datasets (large; keep small fixtures only in tests/fixtures/) ---
+data/
+datasets/
+demos/
+*.h5
+*.hdf5
+*.zarr
+*.zarr/
+*.lmdb
+*.lmdb/
+*.tfrecord
+*.tfrecords
+
+# --- Model checkpoints ---
+ckpts/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+pretrained/
+
+# --- Mesh / large media (commit small thumbnails only via explicit `git add -f`) ---
+*.ply
+*.obj
+*.stl
+*.glb
+*.gltf
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# --- Numerical / arrays ---
+*.npy
+*.npz
+
+# --- Secrets / env ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml

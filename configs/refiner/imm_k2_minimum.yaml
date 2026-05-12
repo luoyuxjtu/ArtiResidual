@@ -1,0 +1,9 @@
+# Ablation: minimum-viable IMM with K=2 hypotheses.
+# Used to test whether 3 hypotheses are necessary or if {revolute, prismatic}
+# alone suffices once continuous refinement is in play.
+# Spec §3 Module 04.
+defaults:
+  - imm_k3
+  - _self_
+
+K: 2

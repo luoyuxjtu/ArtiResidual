@@ -1,0 +1,23 @@
+# Ablation: fine-tune RDT-1B with LoRA instead of training the 50M DiT from scratch.
+# Useful if the 50M-from-scratch is data-starved; lets us claim "even pretrained
+# bimanual diffusion benefits from our refiner".
+# Spec §3 Module 08 (alternative).
+_target_: artiresidual.policy.dit_policy.ArtiResidualDiTPolicy
+backend: rdt_1b_lora
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+action_horizon: 16
+action_dim: 7
+pcd_n_points: 128
+
+diffusion:
+  schedule: cosine
+  prediction_type: v
+  num_train_timesteps: 1000
+  num_inference_steps: 10
+  sampler: ddim

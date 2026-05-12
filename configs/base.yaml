@@ -1,0 +1,42 @@
+# Top-level Hydra config. See artiresidual_tech_spec.md §5.
+#
+# Override at the command line, e.g.:
+#   python -m artiresidual.training.train_refiner --config-name=base \
+#       refiner=imm_k2_minimum global.seed=7 training.batch_size=64
+
+defaults:
+  - refiner: imm_k3
+  - policy: dit_50m
+  - task: multi_handle
+  - _self_
+
+global:
+  seed: 42
+  device: cuda
+  dtype: float32
+
+paths:
+  data_root: /workspace/data
+  ckpt_root: /workspace/ckpts
+  output_root: /workspace/outputs
+
+logging:
+  use_wandb: true
+  project: artiresidual
+  entity: null          # set via env or CLI override on the server
+  tags: []
+  log_every: 50
+  ckpt_every: 5000
+  vis_every: 1000
+
+training:
+  batch_size: 32
+  num_workers: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  warmup_steps: 1000
+  total_steps: 200000
+  amp_dtype: bf16       # bf16 | fp16 | fp32
+  compile: false        # flip on once stable
+  ddp: false

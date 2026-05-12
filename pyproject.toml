@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "artiresidual"
+version = "0.0.1"
+description = "Bimanual diffusion policy with self-correcting articulation perception (IMM residual-flow refiner)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ArtiResidual contributors" }]
+
+# Core deps that are useful even in the codespace (no torch — torch is installed
+# on the server by setup_server.sh against a specific CUDA build).
+dependencies = [
+    "numpy>=1.24",
+    "einops>=0.7",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Installed on the GPU server.
+train = [
+    "wandb>=0.16",
+    "tensorboard>=2.15",
+    "matplotlib>=3.8",
+    "scikit-learn>=1.3",
+    "h5py>=3.10",
+    "zarr>=2.16",
+    "diffusers>=0.27",
+    "transformers>=4.40",
+]
+# Simulator-side extras. Heavy / platform-specific deps live here; sim engines
+# (RoboTwin 2.0, ManiSkill 3) are installed separately per their own READMEs.
+sim = [
+    "trimesh>=4.0",
+    "open3d>=0.18; platform_system == 'Linux'",
+    "sapien>=3.0.0b1",
+]
+# Codespace + server dev tools.
+dev = [
+    "pytest>=7.4",
+    "pytest-xdist>=3.5",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["artiresidual*"]
+exclude = ["tests*", "docs*", "scripts*", "configs*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length is handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B"]
+"__init__.py"   = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-ra -q"
+markers = [
+    "gpu: marks a test that requires a CUDA GPU (skipped by default in codespace)",
+    "sim: marks a test that requires a simulator (RoboTwin / ManiSkill) — server only",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict_optional = true
+warn_unused_ignores = true
+ignore_missing_imports = true

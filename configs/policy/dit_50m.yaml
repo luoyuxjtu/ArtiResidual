@@ -1,0 +1,19 @@
+# ArtiResidual DiT policy — ~50M params target.
+# Spec §3 Module 07 + 08. If params > 80M, reduce depth or dim.
+_target_: artiresidual.policy.dit_policy.ArtiResidualDiTPolicy
+
+dim: 512
+depth: 8
+n_heads: 8
+mlp_ratio: 4
+
+action_horizon: 16     # T_a
+action_dim: 7          # actor-arm 7-DoF delta in joint space
+pcd_n_points: 128
+
+diffusion:
+  schedule: cosine
+  prediction_type: v   # v-prediction; NOT epsilon
+  num_train_timesteps: 1000
+  num_inference_steps: 10
+  sampler: ddim

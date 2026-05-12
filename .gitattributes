@@ -1,0 +1,68 @@
+# Force LF line endings across the project. Cross-platform contributors should
+# never see CRLF noise in diffs.
+* text=auto eol=lf
+
+# Explicit text types (kept LF even if a tool tries to "auto-detect").
+*.py       text eol=lf
+*.pyi      text eol=lf
+*.sh       text eol=lf
+*.bash     text eol=lf
+*.zsh      text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.toml     text eol=lf
+*.cfg      text eol=lf
+*.ini      text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.json     text eol=lf
+*.html     text eol=lf
+*.css      text eol=lf
+*.js       text eol=lf
+*.ts       text eol=lf
+*.cu       text eol=lf
+*.cuh      text eol=lf
+*.c        text eol=lf
+*.cpp      text eol=lf
+*.h        text eol=lf
+*.hpp      text eol=lf
+*.proto    text eol=lf
+Dockerfile text eol=lf
+Makefile   text eol=lf
+
+# Binary blobs — never touched by EOL conversion.
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.webp     binary
+*.ico      binary
+*.pdf      binary
+*.pt       binary
+*.pth      binary
+*.ckpt     binary
+*.safetensors binary
+*.bin      binary
+*.h5       binary
+*.hdf5     binary
+*.zarr     binary
+*.npy      binary
+*.npz      binary
+*.zip      binary
+*.tar      binary
+*.tar.gz   binary
+*.tgz      binary
+*.gz       binary
+*.7z       binary
+*.mp4      binary
+*.mov      binary
+*.avi      binary
+*.ply      binary
+*.obj      binary
+*.stl      binary
+*.glb      binary
+*.gltf     binary
+
+# Treat large files as line-ending agnostic in diffs (they shouldn't be committed
+# anyway — see .gitignore — but this is a belt-and-suspenders rule).
+*.csv      text eol=lf

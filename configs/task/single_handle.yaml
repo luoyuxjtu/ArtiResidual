@@ -1,0 +1,10 @@
+# Single-handle subset — sanity check + comparable-to-prior-work setting.
+# Spec §3 Module 09.
+defaults:
+  - multi_handle
+  - _self_
+
+# Strip down to two simple tasks for quick iteration.
+tasks:
+  - open_cabinet_with_drawer
+  - open_microwave_with_tray

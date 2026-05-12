@@ -1,0 +1,34 @@
+# Multi-handle bimanual benchmark — Innovation 1.
+# Spec §3 Module 09.
+_target_: artiresidual.data.benchmark.MultiHandleBenchmark
+
+sim: robotwin2          # robotwin2 | maniskill3
+
+# Initial 12 tasks (spec §3 Module 09).
+tasks:
+  - open_double_door_cabinet
+  - open_double_drawer
+  - open_fridge_with_freezer
+  - open_microwave_with_tray
+  - lift_pot_by_two_handles
+  - open_suitcase_two_clasps
+  - open_oven_door_and_tray
+  - open_double_door_microwave
+  - unscrew_bottle
+  - open_laptop
+  - open_storage_box
+  - open_cabinet_with_drawer
+
+eval:
+  n_trials_per_task: 100
+  max_steps: 400
+  success_threshold_meters: 0.05
+
+# Domain randomization (inherited from RoboTwin 2.0's 5-axis pattern).
+domain_rand:
+  enable: true
+  light: true
+  texture: true
+  object_pose: true
+  camera: true
+  physics: true
