@@ -1,19 +1,19 @@
-"""Differentiable variants and training utilities for analytical articulation flow.
+"""Training utilities supporting the IMM refiner.
 
-This module wraps `analytical_flow.py` with versions that:
-    1. Allow gradients through (omega, p) — used in joint training & in the
-       refiner's residual head where Δμ updates ω/p in tangent space.
-    2. Allow soft mixing across joint types via softmax over logits — used in
-       early-stage training where the type discrete decision is not yet locked in.
-    3. Compute consistency losses between learned per-point flow and analytical flow,
-       used to train the perception network and to regularize the refiner.
-    4. Compute residual flow Δ_flow = f_predicted - f_cond, the central evidence
-       signal of the self-correction loop.
+Companion to `analytical_flow.py`. Where the analytical-flow file owns the
+geometric primitives (including their differentiable / soft-type variants),
+this file owns the *learning machinery* built on top of them:
 
-It also provides a few small numerical utilities used across training:
-    - tangent-space exponential map for ω updates
-    - cosine-similarity loss (with sign disambiguation)
-    - entropy of hypothesis weights (used as policy meta-conditioning + regularizer)
+    1. Tangent-space exponential map for ω updates (spec §4.4) and clipping
+       primitives used by the refiner's residual head Δμ.
+    2. Consistency losses (cosine + MSE) used to train the perception network
+       (Module 02) and to regularize f_cond ≈ f_pred during joint fine-tune.
+    3. Residual flow Δ_flow = f_predicted - f_cond, the central evidence
+       signal of the self-correction loop, plus scalar summary stats.
+    4. Hypothesis-set utilities: Shannon entropy (consumed by the policy as
+       the "entropy token") and floor-preserving renormalization for the K
+       hypothesis weights.
+    5. GT flow batch generator for training data preparation.
 
 This file CONTAINS NO LEARNABLE PARAMETERS. All operations are pure functions of
 their inputs, with autograd-traceable gradients.
@@ -22,6 +22,9 @@ Conventions:
     - All tensors expected on the same device.
     - All "[..., 3]" tensors use xyz ordering.
     - Batch dimensions are explicit; we never silently squeeze.
+
+NOTE: the {hard, soft, diff} variants of analytical flow used to live here;
+they have moved to `analytical_flow.py` so all three are colocated.
 """
 from __future__ import annotations
 
@@ -31,143 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .analytical_flow import (
-    JOINT_TYPE_FIXED,
-    JOINT_TYPE_PRISMATIC,
-    JOINT_TYPE_REVOLUTE,
-    normalize_axis,
-)
-
-
-# ---------------------------------------------------------------------------
-# Differentiable analytical flow (gradient through omega and p).
-# ---------------------------------------------------------------------------
-
-
-def analytical_flow_diff(
-    coords_xyz: Tensor,
-    omega: Tensor,
-    p: Tensor,
-    joint_type: int,
-    *,
-    normalize_per_part: bool = True,
-    eps: float = 1e-8,
-) -> Tensor:
-    """Differentiable analytical flow.
-
-    Identical math to `analytical_flow.analytical_flow`, but designed so that
-    gradients flow through `omega` and `p`. Used in:
-        - Refiner's Δμ residual head: refiner outputs a tangent-space correction
-          Δω, Δp; the corrected (ω', p') is fed through this function and the loss
-          (NLL of true hypothesis or MSE on flow) backprops through to Δμ.
-        - Stage-3 joint fine-tuning: gradients from the policy's diffusion loss
-          flow through f_cond back to the refiner's hypothesis state. (Note: see
-          §4.1 of the tech spec for stop-gradient policy; this gradient is usually
-          DETACHED in practice. The differentiable version is here in case you
-          want to enable it in ablations.)
-
-    Args:
-        coords_xyz: [N, 3] points (gradient does NOT flow back; coords are observations).
-        omega: [3] axis direction. Gradient flows through this.
-        p: [3] axis reference point. Gradient flows through this.
-        joint_type: discrete int (no gradient — for soft type, use `analytical_flow_soft`).
-        normalize_per_part: see analytical_flow.
-        eps: see analytical_flow.
-
-    Returns:
-        flow: [N, 3] flow with gradient w.r.t. omega, p.
-    """
-    omega_unit = normalize_axis(omega, eps=eps)
-
-    if joint_type == JOINT_TYPE_REVOLUTE:
-        rel = coords_xyz - p.unsqueeze(0)  # [N, 3]
-        flow = torch.linalg.cross(
-            omega_unit.unsqueeze(0).expand_as(rel), rel, dim=-1
-        )
-    elif joint_type == JOINT_TYPE_PRISMATIC:
-        flow = omega_unit.unsqueeze(0).expand(coords_xyz.shape[0], 3)
-    elif joint_type == JOINT_TYPE_FIXED:
-        flow = torch.zeros_like(coords_xyz)
-    else:
-        raise ValueError(f"Unknown joint_type {joint_type}")
-
-    if normalize_per_part:
-        # Use a soft-max-norm via logsumexp for differentiability.
-        # When evaluated at training time on revolute parts where one point is far
-        # from p, hard-max gives non-differentiable kinks; soft-max-norm avoids this.
-        norms = torch.linalg.norm(flow, dim=-1)  # [N]
-        # Soft max via log-sum-exp; smooth approximation of max.
-        soft_max = torch.logsumexp(norms * 10.0, dim=0) / 10.0  # smoothed max
-        flow = flow / soft_max.clamp(min=eps)
-
-    return flow
-
-
-# ---------------------------------------------------------------------------
-# Soft joint-type mixing (gradient through type logits).
-# ---------------------------------------------------------------------------
-
-
-def analytical_flow_soft(
-    coords_xyz: Tensor,
-    omega: Tensor,
-    p: Tensor,
-    joint_type_logits: Tensor,
-    *,
-    normalize_per_part: bool = True,
-    temperature: float = 1.0,
-    eps: float = 1e-8,
-) -> Tensor:
-    """Soft-type mixed analytical flow for early-stage training.
-
-    Computes a softmax-weighted mixture of revolute/prismatic/fixed flows, allowing
-    gradient to flow through `joint_type_logits`. Useful in early training stages
-    where the discrete type decision should be smoothed.
-
-    NOTE: For the v3 ArtiResidual design, the IMM refiner handles type discreteness
-    via parallel hypotheses (each hypothesis has a fixed type, weights vary across
-    hypotheses). So `analytical_flow_soft` is mainly a *legacy* utility kept for:
-        - Ablations comparing IMM vs soft-mix
-        - Early prototyping / debugging
-        - Pre-training perception net where soft type may help
-
-    Args:
-        coords_xyz: [N, 3].
-        omega: [3].
-        p: [3].
-        joint_type_logits: [3] logits for [revolute, prismatic, fixed].
-        normalize_per_part: see analytical_flow.
-        temperature: softmax temperature; lower = harder.
-        eps: see analytical_flow.
-
-    Returns:
-        flow: [N, 3] soft-mixed flow with gradient w.r.t. all of (omega, p, logits).
-    """
-    if joint_type_logits.shape != (3,):
-        raise ValueError(
-            f"joint_type_logits must be [3]; got {tuple(joint_type_logits.shape)}"
-        )
-
-    weights = F.softmax(joint_type_logits / temperature, dim=-1)  # [3]
-
-    # Compute three flows independently. Each is differentiable in (omega, p).
-    flow_rev = analytical_flow_diff(
-        coords_xyz, omega, p, JOINT_TYPE_REVOLUTE,
-        normalize_per_part=normalize_per_part, eps=eps,
-    )
-    flow_pri = analytical_flow_diff(
-        coords_xyz, omega, p, JOINT_TYPE_PRISMATIC,
-        normalize_per_part=normalize_per_part, eps=eps,
-    )
-    flow_fix = torch.zeros_like(coords_xyz)
-
-    # Soft mix.
-    flow = (
-        weights[0] * flow_rev
-        + weights[1] * flow_pri
-        + weights[2] * flow_fix
-    )
-    return flow
+from .analytical_flow import normalize_axis
 
 
 # ---------------------------------------------------------------------------
