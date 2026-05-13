@@ -4,21 +4,14 @@ Living doc. Read **Today's plan** first when resuming work.
 
 ---
 
-## Today's plan (next session: 2026-05-14)
+## Today's plan (next session: 2026-05-15)
 
-1. **Server-side validation of everything from 2026-05-13** (~30 min). See `TEST.md` for exact commands. Order:
-   1. `bash scripts/run_tests.sh` — full CPU suite (~45 tests, < 30 s).
-   2. `bash scripts/setup_sam2.sh` — install SAM2 + open3d on the server (~5–10 min). Only needed once.
-   3. `python scripts/smoke_test_part_tracker.py --sam2-checkpoint $SAM2_CHECKPOINT` — 4-step Section 3.0 smoke. Only verification we'll have until real NERO data lands.
-   4. Three viz scripts (`visualize_analytical_flow.py`, `visualize_state_estimator.py`, `visualize_part_tracker.py`) — eyeball PNGs.
+1. **Implement Module 04 (IMM refiner ★)** — the paper's core contribution.
+   - Read spec §3 Module 04 + §4.3–§4.4 + `docs/PIPELINE_v3.html` first.
+   - Sketch per-hypothesis encoder dimensions BEFORE writing code (30-step window × 384-dim feature is the non-trivial piece).
+   - Hard deps (Modules 05 + 06) are done; mock Module 01–03 outputs at the shape level per spec §2.5.
 
-2. **Pick the next module** to implement. Spec §6 says Module 10 next, but it's blocked on RoboTwin. Choose:
-   - **Recommended:** jump to **Module 04 (IMM refiner ★)** — the paper's core. Its hard deps (Modules 05 + 06) are done; we can mock Module 01–03 outputs at the shape level (spec §2.5 hypothesis shapes are pinned). Unblocks the paper's central algorithm without waiting on the sim install.
-   - Alternative: backfill **Module 01 (prior_estimator)** — ports PAct/FlowBot3D. Needs PartNet-Mobility data; 1-2 weeks of work; spec says ≥70 % accuracy is fine.
-
-3. If Module 04 is the call: read spec §3 Module 04 + §4.3-§4.4 + `docs/PIPELINE_v3.html` first; sketch the per-hypothesis encoder dimensions BEFORE writing code. The 30-step window × 384-dim feature is the most non-trivial piece.
-
-4. Settle the **frame-convention TODO**: `SAM2PartTracker.estimate()` currently returns poses in the camera frame (no extrinsic input). At some point Module 06 will need world-frame poses. Either extend the API to take camera→world, or document that downstream applies the transform.
+2. Settle the **frame-convention TODO**: `SAM2PartTracker.estimate()` returns camera-frame poses. Either extend the API to accept `camera→world`, or document that downstream applies the transform. Decide before Module 04 touches poses.
 
 ---
 
@@ -41,6 +34,37 @@ Nothing actively in progress — day ended at a clean state (working tree clean,
 ---
 
 ## Recently done
+
+### 2026-05-13 — day 2, full session
+
+Server-side validation of all 2026-05-13 code. Fixed a torch version bug introduced by SAM2 install. Added end-to-end pipeline test for the SAM2 → JointStateEstimator chain.
+
+**Validation results:**
+- ✓ 45/45 CPU tests pass in 3.22 s
+- ✓ `visualize_analytical_flow.py` — PNG written, revolute arrows have visible length gradient
+- ✓ `visualize_state_estimator.py` — revolute max err 0.000008° / prismatic 0.000000 mm (spec ≤ 1°/1 mm)
+- ✓ `setup_sam2.sh` — SAM2 + open3d installed; **bug fixed** (SAM2 upgraded torch to 2.11+cu130, breaking CUDA on driver-12.8 server; fixed with `--no-deps` + explicit dep pins)
+- ✓ `smoke_test_part_tracker.py` — 4/4 PASS (`_C` UserWarning is benign per SAM2 docs)
+- ✓ `visualize_part_tracker.py` — IoU=1.000, trans=41.16 mm (expected ~47 mm)
+
+**New script:**
+- ✓ `scripts/e2e_test_state_estimator.py` — end-to-end revolute door test (synthetic rasterizer → SAM2PartTracker → JointStateEstimator). Establishes **1° as the end-to-end acceptance threshold**:
+
+| Door depth noise σ | max \|err\| | mean \|err\| |
+|--------------------|------------|-------------|
+| 0 mm               | 0.000°     | 0.000°      |
+| 2 mm (L515 typical)| 0.069°     | 0.027°      |
+| 5 mm               | 0.316°     | 0.134°      |
+| 10 mm (extreme)    | 0.831°     | 0.354°      |
+
+**Commits pushed to `claude/setup-robot-manipulation-dSiF9`:**
+
+| Hash | Subject |
+|------|---------|
+| `2c933ea` | Fix setup_sam2.sh: install SAM2 with --no-deps to preserve torch cu121 |
+| `15bbcbb` | Add e2e state-estimator pipeline test on synthetic revolute door |
+
+---
 
 ### 2026-05-13 — day 1, full session
 
