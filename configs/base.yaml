@@ -40,3 +40,14 @@ training:
   amp_dtype: bf16       # bf16 | fp16 | fp32
   compile: false        # flip on once stable
   ddp: false
+
+# Upstream part tracker (spec §3.0). Controls where `current_part_pose`
+# comes from at every control step:
+#   true   → read directly from the simulator's ground-truth joint state.
+#            ALWAYS use this during sim training. SAM2 is not loaded.
+#   false  → run SAM2PartTracker (RGB mask tracking + ICP). Use this only
+#            on the physical NERO arms (Section 3.0 acceptance test).
+perception:
+  use_gt_part_pose: true
+  sam2_checkpoint: null    # path to .pt, only consulted when use_gt_part_pose=false
+  sam2_device: cuda
