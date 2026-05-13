@@ -130,6 +130,80 @@ These are LAW. Every module follows them.
 
 For each module: purpose, exact API, reference repo, implementation notes, acceptance test.
 
+---
+
+### Section 3.0: Upstream Perception — SAM2-Based Part Tracker (Non-Trainable)
+
+**This is not a numbered module because it contains no trainable parameters.** It is a pre-processing pipeline that runs before every control step and provides `current_part_pose` to Module 06 (State Estimator). Understanding it is essential for understanding where Module 06's input comes from.
+
+**The problem it solves**: Module 06 needs a 6-DoF pose of the articulated part at each timestep. This pose cannot come from the point cloud directly via a simple lookup — the part is moving, partially occluded, and embedded in a complex scene. We need a tracker.
+
+**Design decision**: Use SAM2 (Segment Anything 2) for 2D mask tracking + ICP for 3D pose estimation. We do NOT train a custom part tracker because (a) SAM2 is already SOTA on visual tracking, (b) training a custom tracker would cost 2+ weeks and introduce a separate failure mode, and (c) multiple 2025 articulated manipulation papers use this exact pipeline (arXiv:2409.16287).
+
+**How it works — step by step**:
+
+```
+t=0 (initialization):
+  1. Run Module 01 → get part_segmentation [B, N, P] (per-point part assignment)
+  2. Project segmentation to 2D image space → get per-part pixel mask
+  3. Initialize SAM2 with these masks as prompts → save SAM2 memory state
+
+t > 0 (every control step):
+  1. Run SAM2.propagate(current_rgb_frame) → updated 2D mask per part
+  2. Back-project masked RGBD pixels → 3D part point cloud subset
+  3. Run ICP (Iterative Closest Point) against t=0 reference part cloud
+     → 6-DoF rigid transform = current_part_pose [7] (3 pos + 4 quat)
+  4. Pass current_part_pose to Module 06 (State Estimator)
+```
+
+**File**: `artiresidual/utils/part_tracker.py`
+
+**API**:
+```python
+class SAM2PartTracker:
+    def __init__(self, sam2_checkpoint: str, device: str = 'cuda'):
+        """Load SAM2 model weights."""
+        ...
+
+    def initialize(
+        self,
+        rgb_frame: np.ndarray,        # [H, W, 3] uint8, t=0 frame
+        part_masks: List[np.ndarray], # per-part 2D binary masks from Module 01
+    ) -> None:
+        """
+        Initialize SAM2 memory with t=0 masks.
+        Must be called once at task start before any estimate() calls.
+        """
+
+    def estimate(
+        self,
+        rgb_frame: np.ndarray,        # [H, W, 3] uint8, current frame
+        depth_frame: np.ndarray,      # [H, W] float32, metric depth in meters
+        camera_intrinsics: np.ndarray,# [3, 3]
+    ) -> np.ndarray:                  # [P, 7] current 6-DoF pose per part (3 pos + 4 quat)
+        """
+        Track parts in current frame and return 6-DoF poses.
+        Internally: SAM2 mask propagation → masked point cloud → ICP.
+        """
+```
+
+**Reference repos**:
+- SAM2: https://github.com/facebookresearch/sam2
+- Open3D ICP (used inside `estimate()`): `open3d.pipelines.registration.registration_icp`
+- SAM2-Track articulation (related use): arXiv:2409.16287
+
+**Implementation notes**:
+- SAM2-base model (~80M params) is fast enough: ~30 ms per frame on A800, affordable even at 30 Hz.
+- ICP convergence: use `max_iteration=50`, `relative_fitness=1e-6`. Initialize with identity transform (parts don't teleport).
+- In simulation (RoboTwin / ManiSkill 3): you can bypass SAM2 entirely and read `current_part_pose` directly from the simulator's ground-truth joint state. SAM2 is only needed for real-robot deployment. Use `config.use_gt_part_pose: bool` to toggle.
+- In training: always use `use_gt_part_pose: True` (sim ground truth). Only switch to SAM2 for real-robot eval.
+
+**Acceptance test**:
+- On 10 real-robot cabinet trajectories: per-frame part pose error ≤ 5 mm translation, ≤ 3° rotation vs. motion-capture ground truth.
+- SAM2 mask IoU ≥ 0.85 across all test frames.
+
+---
+
 ### Module 01: Prior Articulation Estimator
 
 **File**: `artiresidual/perception/prior_estimator.py`
@@ -391,33 +465,59 @@ def analytical_flow(
 
 **File**: `artiresidual/refiner/state_estimator.py`
 
-**Purpose**: At every control step, estimate θ_t from part pose change since t=0.
+**Purpose**: At every control step, convert the current 6-DoF part pose (provided by the upstream SAM2 tracker, see Section 3.0) into a scalar joint configuration θ_t. This is a pure geometric operation — no ML, no learning.
+
+**Where the input comes from** (important — read this):
+- `current_part_pose` is NOT estimated by this module from raw sensors.
+- It comes from `SAM2PartTracker.estimate()` (Section 3.0), which tracks the moving articulated part across frames using RGB video + ICP.
+- In simulation training, it is read directly from the simulator's ground-truth joint state (`use_gt_part_pose: True`).
+- In real-robot deployment, it comes from SAM2 + ICP (`use_gt_part_pose: False`).
 
 **API**:
 ```python
 class JointStateEstimator:
-    def __init__(self, omega, p, joint_type, initial_part_pose):
-        # Stores reference state at t=0
+    def __init__(
+        self,
+        omega: np.ndarray,             # [3] joint axis direction (from hypothesis k)
+        p: np.ndarray,                 # [3] joint axis origin (from hypothesis k)
+        joint_type: int,               # 0=revolute, 1=prismatic
+        initial_part_pose: np.ndarray, # [7] part pose at t=0 (3 pos + 4 quat)
+    ):
+        """
+        One estimator instance per hypothesis. In practice, K instances
+        are maintained in parallel (one per IMM hypothesis).
+        """
         ...
-    
+
     def estimate(self, current_part_pose: Tensor) -> Tensor:
         """
+        Convert current part pose into scalar joint configuration θ_t.
+
+        The upstream SAM2PartTracker (Section 3.0) provides current_part_pose.
+        This module applies a geometric projection to get the scalar θ_t.
+
         Args:
-            current_part_pose: [B, 7] (3 pos + 4 quat) of articulated part at current t
+            current_part_pose: [B, 7] (3 pos + 4 quat) of articulated part
+                               at current timestep. Provided by SAM2PartTracker.
         Returns:
-            theta_t: [B] current joint configuration
+            theta_t: [B] scalar joint configuration.
+                     For revolute: angle in radians since t=0.
+                     For prismatic: displacement in meters since t=0.
         """
 ```
 
+**Geometric formulas**:
+- **Revolute**: Extract the rotation R from the relative transform (initial→current pose). Project onto axis ω: `θ_t = angle_from_axis_angle(R, ω)`.
+- **Prismatic**: Extract translation Δt from the relative transform. Project onto axis ω: `θ_t = dot(Δt, ω)`.
+
 **Implementation notes**:
-- For revolute: project rotation from initial to current pose onto axis ω.
-- For prismatic: project translation from initial to current pose onto axis ω.
-- Need K instances (one per hypothesis).
-- ~150 lines of Python. No ML.
+- One `JointStateEstimator` instance per hypothesis (K=3 instances total). Each uses its own (ω, p) from that hypothesis.
+- ~150 lines of Python. No ML, no autograd needed.
+- The estimator state is just `initial_part_pose` stored at construction time. There is no recurrent state.
 
 **Acceptance test**:
-- On synthetic trajectories with known θ_t: error ≤ 1° (revolute) or ≤ 1 mm (prismatic).
-- Robust to ±0.5 cm Gaussian noise on part pose.
+- On synthetic trajectories with known θ_t (generated from URDF ground truth): θ_t error ≤ 1° (revolute) or ≤ 1 mm (prismatic).
+- Robust to ±0.5 cm Gaussian noise on `current_part_pose` (simulating ICP output noise).
 
 ---
 
@@ -612,13 +712,20 @@ def generate_demos(
     'action': [T, 7],              # actor arm joint delta
     'stab_pose': [T, 7],           # stabilizer pose
     'stab_arm': str,               # 'left' or 'right'
-    
+
+    # Part tracking output (populated from sim GT during training;
+    # from SAM2PartTracker in real-robot eval — see Section 3.0).
+    # Shape: [T, P, 7] where P = number of articulated parts,
+    # 7 = (3 pos + 4 quat) 6-DoF pose in world frame.
+    # Module 06 (State Estimator) reads this field to compute theta_t_gt.
+    'part_poses': [T, P, 7],
+
     # Ground-truth articulation
     'omega_gt': [3],
     'p_gt': [3],
     'joint_type_gt': int,
-    'theta_t_gt': [T],
-    
+    'theta_t_gt': [T],             # scalar per timestep, derived from part_poses via Module 06
+
     # For multi-handle:
     'parts': [{
         'omega': [3], 'p': [3], 'type': int,
@@ -832,10 +939,11 @@ training:
 
 Build modules in this order. **DO NOT skip ahead — dependencies are real**.
 
+0. **SAM2 setup** (Section 3.0) — install SAM2, download checkpoint, verify `SAM2PartTracker` works on a single RGB-D frame from RoboTwin. In sim always use `use_gt_part_pose: True`; SAM2 is only activated during real-robot eval. This step is environment setup, not ML — should take < 1 day.
 1. **Module 05** (analytical_flow) — pure math, easy win
-2. **Module 06** (state_estimator) — geometry, no ML
+2. **Module 06** (state_estimator) — geometry, no ML; test against sim ground-truth part poses
 3. **Module 09** (benchmark) — define tasks first
-4. **Module 10** (demo_gen) — generate data for everything else
+4. **Module 10** (demo_gen) — generate data for everything else; populate `part_poses` from sim GT
 5. **Module 11** (perturb) — augment demos
 6. **Module 01** (prior_estimator) — train on PartNet-Mobility GT
 7. **Module 02** (flow_predictor) — train with sim GT
@@ -847,6 +955,7 @@ Build modules in this order. **DO NOT skip ahead — dependencies are real**.
 13. **Joint fine-tune** (Stage 3): unfreeze everything, low refiner-loss weight
 14. **Module 12** (failure_analysis) — apply to all evaluation runs
 15. **Baselines**: DP3, ACT, fine-tuned RDT-1B, ArticuBot-bimanual, Buchanan replication
+16. **Real-robot switch**: flip `use_gt_part_pose: False`, validate SAM2PartTracker on physical NERO arms
 
 ---
 
@@ -875,12 +984,13 @@ Build modules in this order. **DO NOT skip ahead — dependencies are real**.
 
 | Module | Primary reference |
 |---|---|
+| **Section 3.0 (SAM2 Tracker)** | https://github.com/facebookresearch/sam2 + Open3D ICP |
 | Module 01 (Prior Estimator) | https://github.com/r-pad/flowbot3d |
 | Module 02 (Flow Predictor) | https://github.com/r-pad/flowbot3d + https://github.com/YanjieZe/3D-Diffusion-Policy |
 | Module 03 (Selector) | https://github.com/VoxAct-B/voxact-b |
 | Module 04 (IMM Refiner) | Implement from scratch; reference https://github.com/akloss/differentiable_filters |
 | Module 05 (Analytical Flow) | Student's prior PAct code (`affordance_utils.py`) |
-| Module 06 (State Estimator) | Geometry textbook |
+| Module 06 (State Estimator) | Geometry textbook; input comes from Section 3.0 SAM2 tracker |
 | Module 07 (DiT Block) | https://github.com/facebookresearch/DiT |
 | Module 08 (DiT Policy) | https://github.com/thu-ml/RoboticsDiffusionTransformer + https://github.com/facebookresearch/DiT |
 | Module 09 (Benchmark) | https://github.com/RoboTwin-Platform/RoboTwin |
