@@ -61,8 +61,12 @@ fi
 # ---- 2. pip install SAM2 (editable) ---------------------------------------
 echo "[INFO] installing SAM2 (pip install -e ${SAM2_DIR})..."
 python -m pip install --upgrade pip wheel
-# SAM2 needs torch already present; it will compile CUDA extensions if available.
-pip install -e "${SAM2_DIR}"
+# Install SAM2 without letting it upgrade torch/torchvision: SAM2 declares
+# torch>=2.5.1 but works fine with 2.4.x+cu121. Installing with --no-deps
+# avoids overwriting the cu121 build that matches the server's CUDA 12.x driver.
+# We then install SAM2's other deps (iopath, hydra-core, etc.) explicitly.
+pip install --no-deps -e "${SAM2_DIR}"
+pip install "iopath>=0.1.10" "hydra-core>=1.3.2" "tqdm>=4.66.1"
 
 # ---- 3. download checkpoint -----------------------------------------------
 mkdir -p "${SAM2_DIR}/checkpoints"
