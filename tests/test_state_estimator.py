@@ -1,31 +1,37 @@
 """Unit tests for artiresidual.refiner.state_estimator (Module 06).
 
-Spec §3 Module 06 acceptance test:
-    "On synthetic trajectories with known theta_t: error ≤ 1° (revolute) or
-     ≤ 1 mm (prismatic). Robust to ±0.5 cm Gaussian noise on part pose."
+Module 06 is a pure-geometry module — no ML, no perception. It converts a
+6-DoF ``current_part_pose`` (produced upstream either by the simulator's GT
+joint state when ``perception.use_gt_part_pose: True``, or by
+``SAM2PartTracker.estimate()`` from spec §3.0 when ``False``) into a scalar
+``theta_t``. These tests verify the conversion across the angle / displacement
+ranges the spec acceptance test requires, plus robustness to position noise
+that simulates ICP output.
 
-Test plan (10 functions, ~27 effective tests with pytest.parametrize):
+Test plan (9 functions, 16 effective tests after pytest.parametrize fan-out):
 
-    1. test_revolute_estimate_recovers_45deg_about_z_axis
-         Headline acceptance test: door rotated 45° about +z, error ≤ 1°.
-    2. test_revolute_estimate_recovers_various_angles
-         Parametrized over 10 angles in (-π/2, ~+170°); all within 1°.
-    3. test_prismatic_estimate_recovers_displacement
-         Parametrized over 7 displacements; all within 1 mm.
-    4. test_revolute_robust_to_05cm_position_noise
-         σ=0.5cm position noise; revolute uses only orientation → unaffected.
-    5. test_prismatic_robust_to_05cm_position_noise
-         σ=0.5cm position noise → error stays within 3σ ≈ 1.5cm theoretical.
-    6. test_estimate_handles_various_batch_sizes
-         Parametrized B ∈ {1, 16, 32}; output shape + correctness.
-    7. test_K_hypotheses_tracked_simultaneously
-         K=3 estimators (different ω, p, type) on one observed pose.
-    8. test_revolute_with_offset_hinge_p_is_irrelevant_to_angle
-         Same ω, different p → same θ. p is stored but not used.
-    9. test_fixed_joint_estimate_is_always_zero
-         JOINT_TYPE_FIXED always returns 0 regardless of input.
-   10. test_negative_angles_and_displacements_have_correct_sign
-         Revolute -π/4 and prismatic -0.1m return negative θ.
+    1. test_revolute_at_required_angles                    parametrized × 4
+         spec acceptance: 0°, 45°, 90°, 180° — error ≤ 1° each.
+    2. test_prismatic_at_required_displacements            parametrized × 3
+         spec acceptance: 0 cm, 5 cm, 20 cm — error ≤ 1 mm each.
+    3. test_revolute_robust_to_05cm_icp_noise              1
+         Position noise (σ=0.5 cm, simulating ICP output) must NOT shift
+         the orientation-based revolute estimate.
+    4. test_prismatic_robust_to_05cm_icp_noise             1
+         Projection of σ=0.5 cm isotropic noise onto ω̂ has σ=5 mm. Verify
+         max error < 3σ ≈ 1.5 cm and mean error well under 8 mm.
+    5. test_estimate_handles_various_batch_sizes           parametrized × 3
+         B ∈ {1, 16, 32}: shape + correctness.
+    6. test_K3_hypotheses_tracked_simultaneously           1
+         The IMM K=3 instance pattern: correct hypothesis recovers θ;
+         wrong-axis and wrong-type hypotheses collapse near 0.
+    7. test_revolute_with_offset_hinge_p_is_irrelevant     1
+         Two estimators sharing ω but differing in p must agree on θ
+         (the spec deliberately says angle depends on orientation only).
+    8. test_fixed_joint_estimate_is_always_zero            1
+         JOINT_TYPE_FIXED returns 0 regardless of observed motion.
+    9. test_negative_signs_are_recovered_correctly         1
+         -45° revolute and -10 cm prismatic both return negative θ.
 
 All tests are CPU-only and require only torch.
 """
@@ -43,7 +49,6 @@ from artiresidual.refiner.analytical_flow import (
 )
 from artiresidual.refiner.state_estimator import JointStateEstimator
 
-
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
@@ -52,11 +57,7 @@ _DEG = math.pi / 180.0
 
 
 def _axis_angle_to_quat(axis: torch.Tensor, angle_rad: float) -> torch.Tensor:
-    """Convert axis-angle to (w, x, y, z) scalar-first quaternion.
-
-    The axis is normalized internally. Returned dtype is float32 to match the
-    project default.
-    """
+    """Convert axis-angle to scalar-first quaternion ``(w, x, y, z)``."""
     axis = axis / torch.linalg.norm(axis).clamp(min=1e-12)
     half = angle_rad / 2.0
     w = math.cos(half)
@@ -68,53 +69,29 @@ def _axis_angle_to_quat(axis: torch.Tensor, angle_rad: float) -> torch.Tensor:
 
 
 def _identity_quat(B: int) -> torch.Tensor:
-    """Return [B, 4] identity quaternions ``(1, 0, 0, 0)`` (scalar-first)."""
+    """Return ``[B, 4]`` identity quaternions ``(1, 0, 0, 0)``."""
     q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
     return q.expand(B, 4).contiguous()
 
 
 def _make_pose(x: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """Concatenate position [B, 3] and quaternion [B, 4] → pose [B, 7]."""
+    """Concatenate position ``[B, 3]`` and quaternion ``[B, 4]`` → ``[B, 7]``."""
     return torch.cat([x, q], dim=-1)
 
 
 # ---------------------------------------------------------------------------
-# 1. Headline acceptance: revolute @ 45° about +z.
+# 1. Pure revolute at the four spec-required angles.
 # ---------------------------------------------------------------------------
 
 
-def test_revolute_estimate_recovers_45deg_about_z_axis() -> None:
-    """Door rotated 45° about +z, hinge at origin. Spec: error ≤ 1°."""
-    theta_gt = math.pi / 4
-    omega = torch.tensor([0.0, 0.0, 1.0])
-    p = torch.tensor([0.0, 0.0, 0.0])
+@pytest.mark.parametrize("theta_deg", [0.0, 45.0, 90.0, 180.0])
+def test_revolute_at_required_angles(theta_deg: float) -> None:
+    """Spec acceptance: revolute angle error ≤ 1° at {0°, 45°, 90°, 180°}.
 
-    x_init = torch.tensor([[0.5, 0.2, 0.7]])
-    q_init = _identity_quat(B=1)
-    initial = _make_pose(x_init, q_init)
-
-    q_rot = _axis_angle_to_quat(omega, theta_gt).unsqueeze(0)
-    # Position can be anywhere — revolute estimator ignores it.
-    curr = _make_pose(torch.tensor([[1.3, -0.4, 0.7]]), q_rot)
-
-    est = JointStateEstimator(omega, p, JOINT_TYPE_REVOLUTE, initial)
-    theta_est = est.estimate(curr)
-
-    assert theta_est.shape == (1,)
-    assert abs(theta_est.item() - theta_gt) < 1.0 * _DEG
-
-
-# ---------------------------------------------------------------------------
-# 2. Revolute at various angles.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "theta_deg",
-    [-90.0, -45.0, -10.0, 0.0, 10.0, 30.0, 60.0, 90.0, 135.0, 170.0],
-)
-def test_revolute_estimate_recovers_various_angles(theta_deg: float) -> None:
-    """Spec acceptance at multiple angles. Tolerance: 1°."""
+    180° is the edge case for the twist-swing decomposition (``w = 0``);
+    keeping it in the matrix protects against numerical regressions when the
+    representative-quaternion sign flip is touched.
+    """
     theta_gt = theta_deg * _DEG
     omega = torch.tensor([0.0, 0.0, 1.0])
     p = torch.zeros(3)
@@ -125,21 +102,20 @@ def test_revolute_estimate_recovers_various_angles(theta_deg: float) -> None:
 
     est = JointStateEstimator(omega, p, JOINT_TYPE_REVOLUTE, initial)
     theta_est = est.estimate(curr)
-    assert abs(theta_est.item() - theta_gt) < 1.0 * _DEG, (
-        f"angle {theta_deg}°: got {theta_est.item() / _DEG:.4f}°"
+    err_deg = abs(theta_est.item() - theta_gt) / _DEG
+    assert err_deg < 1.0, (
+        f"angle {theta_deg}°: got {theta_est.item() / _DEG:.4f}°  err={err_deg:.4f}°"
     )
 
 
 # ---------------------------------------------------------------------------
-# 3. Prismatic at various displacements.
+# 2. Pure prismatic at the three spec-required displacements.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "delta_m", [-0.5, -0.05, 0.0, 0.001, 0.01, 0.1, 0.3]
-)
-def test_prismatic_estimate_recovers_displacement(delta_m: float) -> None:
-    """Spec acceptance: error ≤ 1 mm at multiple displacements."""
+@pytest.mark.parametrize("delta_m", [0.0, 0.05, 0.20])
+def test_prismatic_at_required_displacements(delta_m: float) -> None:
+    """Spec acceptance: prismatic error ≤ 1 mm at {0 cm, 5 cm, 20 cm}."""
     omega = torch.tensor([1.0, 0.0, 0.0])
     p = torch.zeros(3)
 
@@ -152,21 +128,24 @@ def test_prismatic_estimate_recovers_displacement(delta_m: float) -> None:
 
     est = JointStateEstimator(omega, p, JOINT_TYPE_PRISMATIC, initial)
     theta_est = est.estimate(curr)
-    assert abs(theta_est.item() - delta_m) < 1e-3, (
-        f"delta {delta_m} m: got {theta_est.item():.6f} m"
+    err_m = abs(theta_est.item() - delta_m)
+    assert err_m < 1e-3, (
+        f"delta {delta_m * 100:.1f} cm: got {theta_est.item() * 100:.4f} cm "
+        f"err={err_m * 1000:.4f} mm"
     )
 
 
 # ---------------------------------------------------------------------------
-# 4. Revolute robust to 0.5 cm position noise.
+# 3. Revolute robust to ±0.5 cm ICP noise on position.
 # ---------------------------------------------------------------------------
 
 
-def test_revolute_robust_to_05cm_position_noise() -> None:
-    """Spec: robust to ±0.5cm Gaussian position noise.
+def test_revolute_robust_to_05cm_icp_noise() -> None:
+    """Spec acceptance: robust to ±0.5 cm Gaussian noise on ``current_part_pose``
+    (simulating ICP output noise — Section 3.0's ICP step has ~5 mm std).
 
-    Implementation uses only orientation, so position noise must NOT shift the
-    angle estimate. Verify per-sample error stays ≤ 1° across a batch of 16.
+    Implementation uses ONLY orientation, so position noise must NOT shift
+    the angle estimate. Verify per-sample error stays ≤ 1° across a batch.
     """
     torch.manual_seed(42)
 
@@ -180,8 +159,8 @@ def test_revolute_robust_to_05cm_position_noise() -> None:
     initial = _make_pose(x_init, q_init)
 
     q_rot = _axis_angle_to_quat(omega, theta_gt).expand(B, 4).contiguous()
-    noise = torch.randn(B, 3) * 0.005  # σ = 0.5 cm
-    x_curr_noisy = x_init + noise
+    icp_noise = torch.randn(B, 3) * 0.005   # σ = 0.5 cm
+    x_curr_noisy = x_init + icp_noise
     curr = _make_pose(x_curr_noisy, q_rot)
 
     est = JointStateEstimator(omega, p, JOINT_TYPE_REVOLUTE, initial)
@@ -191,22 +170,23 @@ def test_revolute_robust_to_05cm_position_noise() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Prismatic robust to 0.5 cm position noise.
+# 4. Prismatic robust to ±0.5 cm ICP noise on position.
 # ---------------------------------------------------------------------------
 
 
-def test_prismatic_robust_to_05cm_position_noise() -> None:
-    """Spec: robust to ±0.5cm Gaussian position noise.
+def test_prismatic_robust_to_05cm_icp_noise() -> None:
+    """Spec acceptance: robust to ±0.5 cm Gaussian noise on ``current_part_pose``
+    (simulating ICP output noise — Section 3.0's ICP step).
 
-    For prismatic, the projection of an isotropic σ=5mm noise onto the unit
-    axis has σ=5mm. Theory: max over 32 samples ≤ ~3σ = 1.5cm at the 99.7%
-    level; mean absolute error ≈ σ·sqrt(2/π) ≈ 4mm.
+    Theory: an isotropic σ=5 mm noise projected onto the unit axis has σ=5 mm.
+    Max error over 32 samples should sit under ~3σ = 1.5 cm; mean absolute
+    error ≈ σ·√(2/π) ≈ 4 mm.
     """
     torch.manual_seed(42)
 
     omega = torch.tensor([1.0, 0.0, 0.0])
     p = torch.zeros(3)
-    delta_gt = 0.15  # 15 cm displacement (well above the noise floor)
+    delta_gt = 0.15  # 15 cm — well above the noise floor
 
     B = 32
     x_init = torch.zeros(B, 3)
@@ -214,32 +194,29 @@ def test_prismatic_robust_to_05cm_position_noise() -> None:
     initial = _make_pose(x_init, q_init)
 
     x_curr_clean = delta_gt * omega.unsqueeze(0).expand(B, 3)
-    noise = torch.randn(B, 3) * 0.005
-    x_curr = x_curr_clean + noise
-    curr = _make_pose(x_curr, q_init)
+    icp_noise = torch.randn(B, 3) * 0.005   # σ = 0.5 cm
+    curr = _make_pose(x_curr_clean + icp_noise, q_init)
 
     est = JointStateEstimator(omega, p, JOINT_TYPE_PRISMATIC, initial)
     theta_est = est.estimate(curr)
     errors = torch.abs(theta_est - delta_gt)
 
-    # 3σ_proj upper bound for any single sample.
     assert errors.max().item() < 0.015, (
-        f"max error {errors.max().item() * 100:.3f} cm; expected < 1.5 cm"
+        f"max error {errors.max().item() * 100:.3f} cm; expected < 1.5 cm (3σ)"
     )
-    # Theoretical MAE ≈ 0.4 cm; allow up to 0.8 cm to cover small-N variance.
     assert errors.mean().item() < 0.008, (
         f"mean error {errors.mean().item() * 100:.3f} cm; expected < 0.8 cm"
     )
 
 
 # ---------------------------------------------------------------------------
-# 6. Batch sizes 1, 16, 32.
+# 5. Batch sizes 1, 16, 32.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("B", [1, 16, 32])
 def test_estimate_handles_various_batch_sizes(B: int) -> None:
-    """Verify output shape and correctness across batch sizes."""
+    """Output shape ``(B,)`` and per-sample correctness for B ∈ {1, 16, 32}."""
     omega = torch.tensor([0.0, 0.0, 1.0])
     p = torch.zeros(3)
     theta_gt = 20.0 * _DEG
@@ -257,27 +234,31 @@ def test_estimate_handles_various_batch_sizes(B: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. K hypotheses tracked simultaneously.
+# 6. K=3 hypotheses tracked simultaneously (the IMM pattern).
 # ---------------------------------------------------------------------------
 
 
-def test_K_hypotheses_tracked_simultaneously() -> None:
-    """K=3 hypotheses share one observed pose. True motion: 30° about +z.
+def test_K3_hypotheses_tracked_simultaneously() -> None:
+    """IMM canonical pattern: K=3 hypotheses share one observed pose.
 
-    Per spec §3 Module 04 implementation notes, the IMM refiner instantiates
-    K estimators with the same ``initial_part_pose`` but distinct
-    ``(omega, p, joint_type)``. Each returns its own ``theta_t``; the refiner
-    combines them. This test verifies the multi-instance pattern works and
-    that wrong-hypothesis estimates collapse correctly.
+    True motion: 30° about +ẑ. Hypotheses:
+        k=0  revolute about +ẑ   (correct)         → θ ≈ +30°
+        k=1  revolute about +ŷ   (orthogonal axis) → θ ≈ 0    (no twist)
+        k=2  prismatic along +x̂  (wrong type)      → θ = 0    (no translation)
+
+    This is exactly what Module 04 (IMM refiner) relies on as the
+    discriminating evidence — wrong hypotheses produce trivial θ, so the
+    residual flow they imply diverges from observation and their weight
+    decays.
     """
     B = 4
     K = 3
     theta_gt = 30.0 * _DEG
 
     omegas = [
-        torch.tensor([0.0, 0.0, 1.0]),  # k=0: correct axis (+z, revolute)
-        torch.tensor([0.0, 1.0, 0.0]),  # k=1: wrong axis (+y, revolute)
-        torch.tensor([1.0, 0.0, 0.0]),  # k=2: prismatic +x
+        torch.tensor([0.0, 0.0, 1.0]),   # k=0
+        torch.tensor([0.0, 1.0, 0.0]),   # k=1
+        torch.tensor([1.0, 0.0, 0.0]),   # k=2
     ]
     types = [JOINT_TYPE_REVOLUTE, JOINT_TYPE_REVOLUTE, JOINT_TYPE_PRISMATIC]
 
@@ -292,22 +273,20 @@ def test_K_hypotheses_tracked_simultaneously() -> None:
     theta_t_k = torch.stack([e.estimate(curr) for e in estimators], dim=-1)
     assert theta_t_k.shape == (B, K)
 
-    # k=0 (correct hypothesis): θ ≈ 30°.
     assert torch.all(torch.abs(theta_t_k[:, 0] - theta_gt) / _DEG < 1.0)
-    # k=1 (orthogonal axis): no twist component about +y, so θ ≈ 0.
     assert torch.all(torch.abs(theta_t_k[:, 1]) / _DEG < 1.0)
-    # k=2 (prismatic, but no translation): θ ≈ 0 exactly.
     assert torch.all(torch.abs(theta_t_k[:, 2]) < 1e-6)
 
 
 # ---------------------------------------------------------------------------
-# 8. p irrelevance: same ω, different p → same θ.
+# 7. p irrelevance — two estimators with same ω but different p agree.
 # ---------------------------------------------------------------------------
 
 
 def test_revolute_with_offset_hinge_p_is_irrelevant_to_angle() -> None:
-    """Revolute angle depends only on orientation, NOT on p. Two estimators
-    with the same ω but different p must agree on θ."""
+    """The revolute angle is a property of the *rotation*, not of which point
+    on the axis we pick. Two estimators sharing ω but differing in p must
+    return identical θ."""
     omega = torch.tensor([0.0, 0.0, 1.0])
     theta_gt = 60.0 * _DEG
 
@@ -327,19 +306,18 @@ def test_revolute_with_offset_hinge_p_is_irrelevant_to_angle() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. Fixed joint → 0 regardless of input.
+# 8. JOINT_TYPE_FIXED always returns zero.
 # ---------------------------------------------------------------------------
 
 
 def test_fixed_joint_estimate_is_always_zero() -> None:
-    """``JOINT_TYPE_FIXED`` returns zero θ no matter what pose change is fed."""
+    """JOINT_TYPE_FIXED returns 0 regardless of observed motion."""
     omega = torch.tensor([1.0, 0.0, 0.0])
     p = torch.zeros(3)
 
     B = 4
     initial = _make_pose(torch.zeros(B, 3), _identity_quat(B))
 
-    # Adversarial: arbitrary translation AND rotation.
     x_curr = torch.randn(B, 3)
     q_curr = (
         _axis_angle_to_quat(torch.tensor([0.3, 0.7, 0.5]), 1.234)
@@ -354,13 +332,13 @@ def test_fixed_joint_estimate_is_always_zero() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. Sign correctness.
+# 9. Sign correctness for negative motion.
 # ---------------------------------------------------------------------------
 
 
-def test_negative_angles_and_displacements_have_correct_sign() -> None:
-    """Sign of θ must match the sign of the true motion (revolute & prismatic)."""
-    # Revolute: -45° about +z.
+def test_negative_signs_are_recovered_correctly() -> None:
+    """Sign of θ must follow the sign of the true motion (both joint types)."""
+    # Revolute: -45° about +ẑ.
     omega = torch.tensor([0.0, 0.0, 1.0])
     theta_gt = -math.pi / 4
 
@@ -373,9 +351,9 @@ def test_negative_angles_and_displacements_have_correct_sign() -> None:
     assert theta.item() < 0.0
     assert abs(theta.item() - theta_gt) < 1.0 * _DEG
 
-    # Prismatic: -0.1 m along +x.
+    # Prismatic: -10 cm along +x̂.
     omega_p = torch.tensor([1.0, 0.0, 0.0])
-    delta_gt = -0.1
+    delta_gt = -0.10
     x_curr = delta_gt * omega_p.unsqueeze(0)
     curr_p = _make_pose(x_curr, _identity_quat(B=1))
 

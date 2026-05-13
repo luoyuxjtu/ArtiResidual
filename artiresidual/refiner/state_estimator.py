@@ -2,26 +2,45 @@
 
 See artiresidual_tech_spec.md §3 Module 06 for the authoritative API.
 
-At every control step, recover the scalar joint configuration ``theta_t`` from
-the articulated part's current 6-DoF pose relative to its reference pose at
-t=0:
+**This is a pure geometric module. It does NO perception and does NO learning.**
+It converts a 6-DoF part pose (which somebody else produced) into a scalar
+joint configuration ``theta_t``:
 
     revolute   theta_t  =  signed twist angle of (q_curr · q_init⁻¹) about ω̂
-                          (extracted via the twist-swing decomposition).
+                          (extracted via the twist-swing decomposition)
     prismatic  theta_t  =  (x_curr - x_init) · ω̂
 
-For multi-hypothesis (IMM) usage, instantiate K independent estimators that
-share the same ``initial_part_pose`` but carry their own (omega, p,
-joint_type). See ``tests/test_state_estimator.py::test_K_hypotheses_*`` for
-the canonical pattern. The IMM refiner (Module 04) creates K=3 instances at
+**Where ``current_part_pose`` comes from** (spec §3 Module 06 "Where the input
+comes from"):
+
+    use_gt_part_pose: True   →  read directly from the simulator's GT joint
+                                state. This is the path used in ALL sim
+                                training / eval. SAM2 is not loaded.
+    use_gt_part_pose: False  →  read from ``SAM2PartTracker.estimate()``
+                                (Section 3.0): SAM2 mask propagation +
+                                open3d ICP. Used only for real-robot eval.
+
+Both upstream sources produce the same ``[B, 7]`` tensor — this module is
+indifferent to which one fed it. The toggle lives in
+``configs/base.yaml → perception.use_gt_part_pose``; this file does not
+inspect it.
+
+Multi-hypothesis (IMM) usage: instantiate K *independent* estimators that
+share the same ``initial_part_pose`` but carry their own ``(omega, p,
+joint_type)``. See ``tests/test_state_estimator.py::test_K3_*`` for the
+canonical pattern. The IMM refiner (Module 04) creates K=3 instances at
 task start.
 
-Pure geometry, no learnable parameters. PyTorch ops are used because (a) the
-refiner's Δμ residual head needs gradients to flow back through ``theta_t``
-into hypothesis (ω, p) in stage-3 joint fine-tune; (b) it keeps device
-handling uniform with the rest of the project.
+Implementation notes (spec §3 Module 06):
+    * Pure geometry, no learnable parameters, **no autograd needed** (we use
+      torch ops because they broadcast nicely and stay on the device; the
+      ops happen to be differentiable, which is incidental — the IMM
+      refiner DETACHES gradients here in practice).
+    * The estimator state is just ``initial_part_pose`` cached at
+      construction; there is no recurrent state.
 
-Quaternion convention (THIS MODULE): scalar-first ``(w, x, y, z)``.
+Quaternion convention (THIS MODULE): scalar-first ``(w, x, y, z)``, matching
+``artiresidual/utils/part_tracker.py``.
 """
 from __future__ import annotations
 
@@ -133,30 +152,46 @@ def _signed_twist_angle(q: Tensor, axis: Tensor) -> Tensor:
 
 
 class JointStateEstimator:
-    """Recover the scalar joint configuration ``theta_t`` from part pose.
+    """Convert a part's current 6-DoF pose into a scalar joint configuration.
 
-    See artiresidual_tech_spec.md §3 Module 06.
+    See artiresidual_tech_spec.md §3 Module 06 (a pure-geometry module — no ML,
+    no learning, no perception).
 
-    Each instance represents ONE articulation hypothesis (one ``(omega, p,
-    joint_type)`` triple) anchored to ONE reference pose at t=0. The estimator
-    is stateless past construction — every ``estimate`` call is a pure function
-    of the current observation and the cached reference state.
+    Each instance represents ONE articulation hypothesis (one
+    ``(omega, p, joint_type)`` triple) anchored to ONE reference pose at t=0.
+    Past construction the estimator is stateless: every ``estimate()`` call is
+    a pure function of the incoming observation and the cached reference.
 
-    Multi-hypothesis (K) usage: instantiate K estimators that share the same
-    ``initial_part_pose`` but have their own ``(omega, p, joint_type)``. The
-    IMM refiner (Module 04) does this at task start with K=3. There is no
-    state to update between calls.
+    **Input source** (spec §3 Module 06 "Where the input comes from"): the
+    ``current_part_pose`` fed to ``estimate()`` is produced upstream by
 
-    Not an ``nn.Module``: no learnable parameters. ``omega`` is stored as a
-    plain tensor on the device the caller passed it on, with the caller's
-    dtype, and gradients flow through it (used by the refiner's Δμ residual
-    head and by stage-3 joint fine-tune).
+        * the simulator's GT joint state, when
+          ``configs/base.yaml → perception.use_gt_part_pose: True``
+          (the path used in ALL sim training / eval), or
+        * ``artiresidual.utils.part_tracker.SAM2PartTracker.estimate()``
+          (Section 3.0), when ``use_gt_part_pose: False``
+          (real-robot eval only).
 
-    Output units:
-        - revolute  → radians, in ``(-π, π]``.
-        - prismatic → same length unit as ``initial_part_pose[..., :3]``
-                      (meters in this project).
-        - fixed     → zeros.
+    This module does not care which source; it only does the geometric
+    projection.
+
+    **Multi-hypothesis (K) usage**: instantiate K estimators that share the
+    same ``initial_part_pose`` but have their own ``(omega, p, joint_type)``.
+    The IMM refiner (Module 04) does this at task start with K=3. There is no
+    state to update between calls. See
+    ``tests/test_state_estimator.py::test_K3_hypotheses_tracked_simultaneously``
+    for the canonical pattern.
+
+    **Not an ``nn.Module``**: no learnable parameters; spec §3 Module 06 says
+    "no autograd needed". We still use torch ops so ``omega`` stays on the
+    caller's device and dtype; gradients happen to flow through it if the
+    caller leaves them on, but the IMM refiner detaches in practice.
+
+    **Output units**:
+        revolute   radians, in ``(-π, π]``.
+        prismatic  same length unit as ``initial_part_pose[..., :3]``
+                   (meters in this project).
+        fixed      zeros.
     """
 
     def __init__(
@@ -217,7 +252,11 @@ class JointStateEstimator:
         self._B: int = initial_part_pose.shape[0]
 
     def estimate(self, current_part_pose: Tensor) -> Tensor:
-        """Estimate ``theta_t`` for the current observation.
+        """Project the current 6-DoF part pose into a scalar joint configuration.
+
+        The upstream caller is either the simulator (sim GT, default during
+        training) or ``SAM2PartTracker.estimate()`` (Section 3.0, real-robot
+        only). See the class docstring for the toggle.
 
         Args:
             current_part_pose: [B, 7] = 3-pos + 4-quat ``(w, x, y, z)`` at the
@@ -225,8 +264,10 @@ class JointStateEstimator:
                 construction.
 
         Returns:
-            theta_t: [B] joint configuration scalar (radians for revolute,
-                meters for prismatic, zeros for fixed).
+            theta_t: [B] scalar joint configuration.
+                revolute   angle in radians since t=0, in ``(-π, π]``.
+                prismatic  displacement in meters since t=0.
+                fixed      zeros.
 
         Raises:
             ValueError: on shape mismatch.
