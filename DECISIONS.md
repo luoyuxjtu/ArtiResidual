@@ -69,3 +69,7 @@ First version had unanchored `data/`, which silently matched `artiresidual/data/
 ## 2026-05-13  ·  Module 06 uses torch even though spec says "no autograd needed"
 
 Spec §3 Module 06 says "no autograd needed". Implementation still uses torch ops because they broadcast cleanly, stay on the caller's device, and incidentally support autograd if the caller wants it (the IMM refiner detaches in practice). A numpy-only rewrite would be a downgrade for negligible benefit.  · spec §3 Module 06
+
+## 2026-05-14  ·  SAM2PartTracker frame convention: camera-frame output; cam→world is the caller's responsibility
+
+Option B selected: `SAM2PartTracker.estimate()` API is unchanged — it returns poses in the **camera frame** and accepts no extrinsics. The caller must apply the cam→world transform before passing poses to Module 04 or Module 06. Canonical helper: `artiresidual.utils.geometry.transform_poses(poses, cam_to_world)` which applies a [4, 4] rigid transform to a [..., 7] pose batch. Module 04 `step()` documents this obligation explicitly ("all part poses in `window` must be in world frame"). Rationale: keeps SAM2PartTracker's API minimal and makes the frame obligation loud at the call site. The tracker can be extended to accept extrinsics later without a breaking API change.  · spec §3.0 (spec is silent on frame convention)

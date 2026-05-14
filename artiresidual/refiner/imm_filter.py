@@ -32,4 +32,332 @@ References:
 """
 from __future__ import annotations
 
-__all__: list[str] = []
+import math
+from typing import Any, Tuple
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from artiresidual.refiner.affordance_utils import (
+    clip_axis_correction,
+    clip_position_correction,
+    exp_map_sphere,
+    hypothesis_entropy,
+    renormalize_with_floor,
+)
+from artiresidual.refiner.analytical_flow import (
+    JOINT_TYPE_PRISMATIC,
+    JOINT_TYPE_REVOLUTE,
+    analytical_flow_batched,
+    belief_weighted_flow,
+)
+
+__all__ = ["IMMArticulationRefiner"]
+
+
+# ---------------------------------------------------------------------------
+# Private sub-modules
+# ---------------------------------------------------------------------------
+
+
+class _PointNetMini(nn.Module):
+    """3-layer per-point MLP + global mean-pool (no max-pool, no local grouping).
+
+    Spec §3 Module 04: PointNet-mini (3 layers, 64→128→256) → mean-pool → dim.
+    Shared weights across K hypotheses and across T window steps; callers are
+    responsible for batching along those dimensions before calling forward.
+
+    Args:
+        in_dim: input feature dimension per point (default 3 for xyz flow).
+        out_dim: global feature dimension after pooling (default 256).
+    """
+
+    def __init__(self, in_dim: int = 3, out_dim: int = 256) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, out_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: [..., N, in_dim] per-point features.
+
+        Returns:
+            [..., out_dim] global feature via mean-pool over the N dimension.
+        """
+        feat = self.mlp(x)     # [..., N, out_dim]
+        return feat.mean(dim=-2)  # [..., out_dim]
+
+
+# ---------------------------------------------------------------------------
+# Main module
+# ---------------------------------------------------------------------------
+
+
+class IMMArticulationRefiner(nn.Module):
+    """IMM Articulation Refiner — paper's central technical contribution.
+
+    Maintains K parallel hypotheses about (omega, p, joint_type) and refines
+    them every N control steps. See module docstring for full description.
+
+    Architecture (spec §3 Module 04):
+        1. Per-step feature encoding:
+             flow_encoder  : [B*K*T, N, 3] delta_flow → [B*K*T, dim]
+             wrench_mlp    : [B*K*T, 15]   (wrench 12 + wrench_res 3) → [B*K*T, 64]
+             action_mlp    : [B*T,   14]   action → [B*T, 64]   (shared across K)
+             step_proj     : [B*K*T, dim+128] concat → [B*K*T, dim]
+        2. Per-hypothesis transformer encoder (shared weights across K):
+             hyp_encoder   : [B*K, T, dim] → [B*K, T, dim] → mean-pool → [B*K, dim]
+        3. Cross-hypothesis attention (K tokens see each other):
+             cross_hyp_attn: [B, K, dim] → [B, K, dim]
+        4. Output heads per hypothesis:
+             ll_head       : [B, K, dim] → [B, K]   log-likelihood score ℓ_k
+             residual_head : [B, K, dim] → [B, K, 6] tangent-space Δω(3) + Δp(3)
+
+    Args:
+        config: Hydra DictConfig (or any object with attribute access) with
+            fields: K, window_T, update_interval_N, dim, n_heads, n_layers,
+            w_min, lambda_H, eta, omega_clip_deg, p_clip_m.
+    """
+
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+
+        # --- Scalar hyperparameters -------------------------------------------
+        self.K: int = int(config.K)                           # number of hypotheses
+        self.window_T: int = int(config.window_T)             # evidence window length
+        self.N_update: int = int(config.update_interval_N)   # call step() every N steps
+        self.w_min: float = float(config.w_min)              # weight floor (0.05)
+        self.eta: float = float(config.eta)                  # residual learning rate (0.5)
+        self.omega_clip_rad: float = math.radians(float(config.omega_clip_deg))  # 30° → rad
+        self.p_clip_m: float = float(config.p_clip_m)        # 5 cm
+        self.lambda_H: float = float(config.lambda_H)        # entropy regularization weight
+
+        dim: int = int(config.dim)         # 256 — transformer model width
+        n_heads: int = int(config.n_heads) # 4
+        n_layers: int = int(config.n_layers)  # 4
+
+        # --- Per-step flow encoder (PointNet-mini, shared across K and T) ----
+        # Encodes the per-point flow residual Δ_flow_k = f_pred - f_ana(hyp_k)
+        # into a global 256-dim token representing "how well does hypothesis k
+        # predict the observed flow at this step".
+        # Call-time shape: [B*K*T, N, 3] → [B*K*T, dim]
+        self.flow_encoder = _PointNetMini(in_dim=3, out_dim=dim)
+
+        # --- Per-step wrench encoder ------------------------------------------
+        # Encodes (wrench, per-hypothesis wrench residual) into a 64-dim token.
+        # Wrench residual = observed wrench projected against expected constraint
+        # direction for this hypothesis (constraint_directions() in Module 05).
+        # Call-time shape: [B*K*T, 15] → [B*K*T, 64]
+        self.wrench_mlp = nn.Sequential(
+            nn.Linear(12 + 3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+        )
+
+        # --- Per-step action encoder ------------------------------------------
+        # Encodes the bimanual joint command (14-dim) into 64 features.
+        # Shared across K hypotheses; broadcasted at concat time.
+        # Call-time shape: [B*T, 14] → [B*T, 64]
+        self.action_mlp = nn.Sequential(
+            nn.Linear(14, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+        )
+
+        # --- Step-feature projection: (dim + 64 + 64) → dim ------------------
+        # After concatenating flow(dim=256) + wrench(64) + action(64) = 384,
+        # project down to dim so the per-hypothesis transformer sees dim-wide tokens.
+        # Call-time shape: [B*K*T, 384] → [B*K*T, dim]
+        self.step_proj = nn.Linear(dim + 64 + 64, dim)
+
+        # --- Per-hypothesis transformer encoder (shared weights across K) -----
+        # Processes the T-step window for one hypothesis; shared weights mean
+        # all K hypotheses go through identical learned dynamics.
+        # Call-time shape (batch_first=True): [B*K, T, dim] → [B*K, T, dim]
+        # then mean-pooled over T → [B*K, dim] hypothesis summary token.
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=n_heads,
+            dim_feedforward=dim * 4,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,  # Pre-LN for training stability (Wang et al. 2022).
+        )
+        self.hyp_encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        # --- Cross-hypothesis attention (1 layer, IMM mode-mixing) ------------
+        # Lets K hypothesis tokens attend to each other so the refiner can
+        # avoid collapsing two hypotheses onto identical corrections when evidence
+        # is ambiguous.
+        # Call-time shape: [B, K, dim] → [B, K, dim]
+        cross_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=n_heads,
+            dim_feedforward=dim * 4,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.cross_hyp_attn = nn.TransformerEncoder(cross_layer, num_layers=1)
+
+        # --- Output heads (applied per hypothesis after cross-attention) ------
+        # Log-likelihood score: drives the IMM weight update (spec §4.3).
+        # [B, K, dim] → [B, K, 1] → squeeze → [B, K]
+        self.ll_head = nn.Linear(dim, 1)
+
+        # Tangent-space residual: Δω ∈ ℝ³ (tangent of S² at ωₖ) and Δp ∈ ℝ³.
+        # Applied via exp_map_sphere (ω) and clipped translation (p) with η=0.5.
+        # [B, K, dim] → [B, K, 6]
+        self.residual_head = nn.Linear(dim, 6)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialize output heads so the refiner starts near identity.
+
+        Near-zero initialization means: at the start of training,
+        - All log-likelihoods ≈ 0  → equal weights among hypotheses (max entropy).
+        - All residuals ≈ 0        → no correction applied (identity update).
+        This prevents early destructive hypothesis collapse before the encoder
+        has learned anything useful.
+        """
+        nn.init.zeros_(self.ll_head.bias)
+        nn.init.normal_(self.ll_head.weight, std=0.01)
+        nn.init.zeros_(self.residual_head.bias)
+        nn.init.normal_(self.residual_head.weight, std=0.01)
+
+    # -------------------------------------------------------------------------
+    # Public API (stubs — implemented in subsequent sessions)
+    # -------------------------------------------------------------------------
+
+    def init_hypotheses(self, prior_output: dict) -> dict:
+        """Initialize K hypotheses from Module 01 prior estimator output.
+
+        The top-scoring hypothesis from the prior gets weight 0.6; the remaining
+        K-1 hypotheses share 0.4 equally (= 0.2 each for K=3). Hypothesis axes
+        are initialized as:
+            h1 = top-1 from prior (vertical-axis revolute by default)
+            h2 = top-1 axis rotated 90° about z (horizontal-axis revolute)
+            h3 = same axis as h1 but prismatic
+
+        Args:
+            prior_output: dict from Module 01 (PriorArticulationEstimator):
+                - 'omega':      [B, 3]  predicted axis direction (unit).
+                - 'p':          [B, 3]  predicted axis origin.
+                - 'joint_type': [B]     predicted joint type (long: 0=rev, 1=pris).
+                - 'confidence': [B]     confidence in the top-1 prediction.
+
+        Returns:
+            hypotheses: dict with
+                - 'omega_k': [B, K, 3]  axis direction per hypothesis.
+                - 'p_k':     [B, K, 3]  axis origin per hypothesis.
+                - 'type_k':  [B, K]     long: 0=revolute, 1=prismatic.
+                - 'w_k':     [B, K]     weights summing to 1; top gets 0.6.
+        """
+        raise NotImplementedError
+
+    def step(
+        self,
+        hypotheses: dict,
+        window: dict,
+    ) -> dict:
+        """Refine hypotheses given the last T steps of evidence.
+
+        Called every N=10 control steps by the outer rollout loop.
+
+        **Frame convention (DECISION 2026-05-14)**:
+            All part poses and point clouds flowing through ``window`` must be
+            in the **world frame**. The caller is responsible for applying
+            ``artiresidual.utils.geometry.transform_poses(poses, cam_to_world)``
+            before packing them into the window dict. This function does NOT
+            silently accept camera-frame input.
+
+        Update sequence (spec §4.3 + §4.4):
+            1. Encode per-step features over the T-step window.
+            2. Run per-hypothesis transformer encoder → K summary tokens.
+            3. Cross-hypothesis attention → mode-mixing.
+            4. ll_head  → ℓ_k → weight update:
+                   w_k_new ∝ w_k · exp(ℓ_k), with floor w_min.
+            5. residual_head → Δω_k, Δp_k → apply via exp_map_sphere (ω)
+                   and clipped translation (p) with learning rate η.
+            6. type_k is NEVER changed by the refiner (v1: discrete, immutable).
+
+        Args:
+            hypotheses: dict (same layout as ``init_hypotheses`` output or a
+                prior ``step`` return):
+                - 'omega_k': [B, K, 3]
+                - 'p_k':     [B, K, 3]
+                - 'type_k':  [B, K]     long
+                - 'w_k':     [B, K]
+            window: dict with T steps of evidence (all in **world frame**):
+                - 'delta_flow_k': [B, K, T, N, 3]   Δflow = f_pred − f_ana(hyp_k)
+                - 'wrench':       [B, T, 12]          observed bimanual wrench
+                - 'wrench_res_k': [B, K, T, 3]        per-hyp wrench residual dir
+                - 'action':       [B, T, 14]           bimanual joint commands
+
+        Returns:
+            hypotheses_new: dict with same keys as ``hypotheses``;
+                (omega_k, p_k, w_k) updated; type_k unchanged.
+        """
+        raise NotImplementedError
+
+    def get_f_cond(
+        self,
+        hypotheses: dict,
+        theta_t: Tensor,
+        pcd: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Compute belief-weighted flow and entropy for the DiT policy.
+
+        Called every control step (not just at refiner update steps) so the
+        policy always has up-to-date conditioning.
+
+        Args:
+            hypotheses: dict with current hypothesis state (world frame).
+            theta_t: [B]     current joint angle (rad) or displacement (m)
+                             from Module 06 JointStateEstimator.
+            pcd:     [B, N, 3] current point cloud in world frame.
+
+        Returns:
+            f_cond:  [B, N, 3]  Σ_k w_k · f_ana(ω_k, p_k, type_k) — the
+                                belief-weighted analytical flow (spec §4.5).
+                                This is the primary conditioning signal for
+                                the DiT policy's cross-attention 1.
+            entropy: [B]        H(w) = −Σ_k w_k log(w_k) (spec §4.6).
+                                Injected as the DiT policy's "entropy token"
+                                (cross-attention 2) so the policy knows how
+                                uncertain the current belief is.
+        """
+        raise NotImplementedError
+
+    def loss_terms(
+        self,
+        hypotheses: dict,
+        gt_omega: Tensor,
+        gt_p: Tensor,
+        gt_type_idx: Tensor,
+    ) -> dict[str, Tensor]:
+        """Compute Stage-1 refiner training losses (spec §4.8–§4.10).
+
+        Args:
+            hypotheses: dict after one ``step`` call (gradients should flow
+                through w_k, omega_k, p_k from the update computation).
+            gt_omega:     [B, 3]  ground-truth joint axis direction.
+            gt_p:         [B, 3]  ground-truth axis origin.
+            gt_type_idx:  [B]     long, index of the correct hypothesis.
+
+        Returns:
+            dict with scalar tensors:
+                - 'L_NLL':          -log(w_k*),  NLL for correct hypothesis.
+                - 'L_mu_residual':  axis + position regression loss.
+                - 'L_H':            entropy regularization (−λ_H · H(w)).
+                - 'L_total':        weighted sum (λ_refiner=0.1 applied upstream).
+        """
+        raise NotImplementedError
