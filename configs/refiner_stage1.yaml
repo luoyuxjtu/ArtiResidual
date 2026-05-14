@@ -1,0 +1,32 @@
+# Stage 1 — Train the IMM articulation refiner with the policy frozen.
+#
+# Run with:
+#   python -m artiresidual.training.train_refiner --config-name=refiner_stage1
+#
+# Or for DDP on 2× A800:
+#   torchrun --nproc_per_node=2 -m artiresidual.training.train_refiner \
+#       --config-name=refiner_stage1
+#
+# Key differences from base.yaml:
+#   - 100 k steps (refiner warms up faster than joint-train)
+#   - ddp=true (auto-detected from LOCAL_RANK; set false to force single-GPU)
+#   - ckpt_every=5000, acceptance_every=10000
+
+defaults:
+  - base
+  - _self_
+
+training:
+  total_steps: 100000
+  ddp: true              # auto-detected from LOCAL_RANK env var
+
+logging:
+  ckpt_every: 5000
+
+# Stage-1 specific knobs (consumed by train_refiner.py, not the model).
+stage1:
+  lambda_p: 100.0        # position error weight in L_mu_residual
+  acceptance_every: 10000
+  dataset: mock          # "mock" until Module 11 (real perturbed demos) is ready
+  n_samples: 6000        # spec: 12 tasks × 100 demos × 5 replays
+  N_points: 64           # points per cloud in the evidence window

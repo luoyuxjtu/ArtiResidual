@@ -588,21 +588,60 @@ class IMMArticulationRefiner(nn.Module):
         gt_omega: Tensor,
         gt_p: Tensor,
         gt_type_idx: Tensor,
+        *,
+        lambda_p: float = 100.0,
     ) -> dict[str, Tensor]:
         """Compute Stage-1 refiner training losses (spec §4.8–§4.10).
 
         Args:
-            hypotheses: dict after one ``step`` call (gradients should flow
-                through w_k, omega_k, p_k from the update computation).
-            gt_omega:     [B, 3]  ground-truth joint axis direction.
-            gt_p:         [B, 3]  ground-truth axis origin.
-            gt_type_idx:  [B]     long, index of the correct hypothesis.
+            hypotheses:  dict output of ``step()`` — gradients flow through
+                         (omega_k, p_k, w_k).
+            gt_omega:    [B, 3]  ground-truth joint axis (need not be unit).
+            gt_p:        [B, 3]  ground-truth axis origin.
+            gt_type_idx: [B]     long, correct hypothesis index in {0, …, K−1}.
+            lambda_p:    scaling factor for the position error term (default
+                         100.0 — gives ~equal scale as cosine loss at σ_p≈0.1 m).
 
         Returns:
             dict with scalar tensors:
-                - 'L_NLL':          -log(w_k*),  NLL for correct hypothesis.
-                - 'L_mu_residual':  axis + position regression loss.
-                - 'L_H':            entropy regularization (−λ_H · H(w)).
-                - 'L_total':        weighted sum (λ_refiner=0.1 applied upstream).
+                - 'L_NLL':         −log(w_{k*}),  NLL for ground-truth hypothesis.
+                - 'L_mu_residual': Σ_k w_k·[(1−cos(ω_k,ω*))+λ_p‖p_k−p*‖²].
+                - 'L_H':           −λ_H·H(w),  entropy regularizer (≤ 0).
+                - 'L_total':       L_NLL + L_mu_residual + L_H.
         """
-        raise NotImplementedError
+        omega_k = hypotheses["omega_k"]   # [B, K, 3]
+        p_k     = hypotheses["p_k"]       # [B, K, 3]
+        w_k     = hypotheses["w_k"]       # [B, K]
+
+        eps = 1e-8
+
+        # L_NLL: -log(w_{k*}) where k* is the correct hypothesis index.
+        w_gt = w_k.gather(1, gt_type_idx.unsqueeze(1)).squeeze(1)  # [B]
+        L_NLL = -torch.log(w_gt.clamp(min=eps)).mean()
+
+        # L_mu_residual: belief-weighted axis + position regression.
+        gt_omega_unit = (
+            gt_omega / gt_omega.norm(dim=-1, keepdim=True).clamp(min=eps)
+        )  # [B, 3]
+        omega_unit = (
+            omega_k / omega_k.norm(dim=-1, keepdim=True).clamp(min=eps)
+        )  # [B, K, 3]
+        cos_k = (omega_unit * gt_omega_unit.unsqueeze(1)).sum(dim=-1)  # [B, K]
+        loss_cos = 1.0 - cos_k                                          # [B, K], ∈[0,2]
+        p_err_sq = (p_k - gt_p.unsqueeze(1)).pow(2).sum(dim=-1)        # [B, K]
+        per_hyp = loss_cos + lambda_p * p_err_sq
+        L_mu_residual = (w_k * per_hyp).sum(dim=-1).mean()
+
+        # L_H: -λ_H·H(w).  Minimizing -H(w) = maximizing H(w) → anti-collapse.
+        L_H = (-self.lambda_H * hypothesis_entropy(w_k)).mean()
+
+        return {
+            "L_NLL": L_NLL,
+            "L_mu_residual": L_mu_residual,
+            "L_H": L_H,
+            "L_total": L_NLL + L_mu_residual + L_H,
+        }
+
+    def forward(self, hypotheses: dict, window: dict) -> dict:
+        """DDP-compatible forward pass; dispatches to step(). See step() docs."""
+        return self.step(hypotheses, window)

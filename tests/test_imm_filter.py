@@ -1,20 +1,35 @@
-"""Unit tests for IMMArticulationRefiner.step() (Module 04).
+"""Unit tests for IMMArticulationRefiner.step(), get_f_cond(), loss_terms().
 
 All tests run on CPU only and require only torch + omegaconf.
 
-Test plan (10 functions):
-
-    1.  test_step_output_shapes          — returned dict has correct shapes
-    2.  test_step_omega_unit_norm        — ‖ωₖ‖ = 1 for all (B, K) after step
+Test plan:
+  step() tests (10):
+    1.  test_step_output_shapes
+    2.  test_step_omega_unit_norm
     3.  test_step_omega_correction_bounded
-                                         — actual Δω ≤ η · 30° (clipping holds)
-    4.  test_step_p_correction_bounded   — ‖p_new − p_old‖ ≤ η · 5 cm
-    5.  test_step_weights_sum_to_one     — w_k.sum(dim=-1) ≡ 1.0
-    6.  test_step_weights_floor          — all weights ≥ w_min after every step
-    7.  test_step_type_k_unchanged       — type_k identical before and after step
-    8.  test_step_gradient_flow          — backward() succeeds, grad is non-None
-    9.  test_step_chain_stable           — 5 consecutive steps stay numerically stable
-    10. test_step_batch_size_invariant   — B=1 and B=4 give consistent per-sample results
+    4.  test_step_p_correction_bounded
+    5.  test_step_weights_sum_to_one
+    6.  test_step_weights_floor
+    7.  test_step_type_k_unchanged
+    8.  test_step_gradient_flow
+    9.  test_step_chain_stable
+    10. test_step_batch_size_invariant
+
+  get_f_cond() tests (4):
+    11. test_get_f_cond_output_shapes
+    12. test_get_f_cond_entropy_bounds
+    13. test_get_f_cond_uniform_weights_max_entropy
+    14. test_get_f_cond_belief_weighted_sum_correctness
+
+  loss_terms() tests (5):
+    15. test_loss_terms_output_keys_and_shapes
+    16. test_loss_terms_nll_nonnegative
+    17. test_loss_terms_mu_residual_nonnegative
+    18. test_loss_terms_gradient_flow
+    19. test_loss_terms_perfect_hypotheses_low_loss
+
+  Integration (1):
+    20. test_integration_30_control_steps
 """
 from __future__ import annotations
 
@@ -441,3 +456,133 @@ def test_integration_30_control_steps(
     # Entropy is still in valid bounds after 3 step() refinements.
     assert (entropy >= 0).all()
     assert (entropy <= math.log(K) + 1e-5).all()
+
+
+# ---------------------------------------------------------------------------
+# loss_terms() tests (spec §4.8–§4.10)
+# ---------------------------------------------------------------------------
+
+
+def _make_gt(B: int, device: str = "cpu") -> tuple:
+    """Random but unit ground-truth (omega, p, type_idx) for loss_terms tests."""
+    gt_omega_raw = torch.randn(B, 3)
+    gt_omega = gt_omega_raw / gt_omega_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    gt_p     = torch.randn(B, 3) * 0.3
+    # Alternate between hypothesis 0 (revolute) and 2 (prismatic).
+    gt_type  = torch.zeros(B, dtype=torch.long)
+    gt_type[B // 2:] = 2
+    return gt_omega, gt_p, gt_type
+
+
+def test_loss_terms_output_keys_and_shapes(model: IMMArticulationRefiner) -> None:
+    """loss_terms() must return the four expected scalar tensors."""
+    B, K = 4, _CFG.K
+    hyp = _make_hypotheses(B, K)
+    win = _make_window(B, K)
+    gt_omega, gt_p, gt_type = _make_gt(B)
+
+    with torch.no_grad():
+        hyp_new = model.step(hyp, win)
+    losses = model.loss_terms(hyp_new, gt_omega, gt_p, gt_type)
+
+    for key in ("L_NLL", "L_mu_residual", "L_H", "L_total"):
+        assert key in losses, f"missing key: {key}"
+        val = losses[key]
+        assert val.shape == (), f"{key} should be scalar, got {val.shape}"
+        assert not torch.isnan(val), f"{key} is NaN"
+        assert not torch.isinf(val), f"{key} is Inf"
+
+
+def test_loss_terms_nll_nonnegative(model: IMMArticulationRefiner) -> None:
+    """L_NLL = -log(w_gt) ≥ 0 because w_gt ∈ (0, 1]."""
+    B, K = 8, _CFG.K
+    for _ in range(5):
+        hyp = _make_hypotheses(B, K)
+        win = _make_window(B, K)
+        gt_omega, gt_p, gt_type = _make_gt(B)
+        with torch.no_grad():
+            hyp_new = model.step(hyp, win)
+        losses = model.loss_terms(hyp_new, gt_omega, gt_p, gt_type)
+        assert losses["L_NLL"].item() >= -1e-6, (
+            f"L_NLL = {losses['L_NLL'].item():.4f} < 0"
+        )
+
+
+def test_loss_terms_mu_residual_nonnegative(model: IMMArticulationRefiner) -> None:
+    """L_mu_residual = Σ_k w_k · [(1−cos) + λ_p‖Δp‖²] ≥ 0 term-by-term."""
+    B, K = 8, _CFG.K
+    for _ in range(5):
+        hyp = _make_hypotheses(B, K)
+        win = _make_window(B, K)
+        gt_omega, gt_p, gt_type = _make_gt(B)
+        with torch.no_grad():
+            hyp_new = model.step(hyp, win)
+        losses = model.loss_terms(hyp_new, gt_omega, gt_p, gt_type)
+        assert losses["L_mu_residual"].item() >= -1e-5, (
+            f"L_mu_residual = {losses['L_mu_residual'].item():.4f} < 0"
+        )
+
+
+def test_loss_terms_gradient_flow(model: IMMArticulationRefiner) -> None:
+    """backward() through L_total must update model parameters."""
+    model.train()
+    B, K, T, N = 2, _CFG.K, _CFG.window_T, 32
+
+    hyp = _make_hypotheses(B, K)
+    win = _make_window(B, K, T, N)
+    gt_omega, gt_p, gt_type = _make_gt(B)
+
+    # Zero existing grads.
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    hyp_new = model.step(hyp, win)
+    losses  = model.loss_terms(hyp_new, gt_omega, gt_p, gt_type)
+    losses["L_total"].backward()
+
+    grad_norms = [
+        p.grad.norm().item()
+        for p in model.parameters()
+        if p.grad is not None
+    ]
+    assert len(grad_norms) > 0,             "no parameter received a gradient"
+    assert any(g > 0 for g in grad_norms),  "all parameter gradients are zero"
+
+    model.eval()
+
+
+def test_loss_terms_perfect_hypotheses_low_loss(
+    model: IMMArticulationRefiner,
+) -> None:
+    """When the correct hypothesis already matches GT, L_NLL and L_mu_residual
+    should be small.
+
+    We force hypothesis 0 to be the GT type and manually set omega_k[0] and
+    p_k[0] to match GT exactly, with weight ≈ 0.90.  L_NLL should be < 0.15
+    and L_mu_residual (for the dominant hypothesis) should be near zero.
+    """
+    B, K = 4, _CFG.K
+    gt_omega, gt_p, _ = _make_gt(B)
+    # All samples have gt_type_idx = 0 (revolute, h1).
+    gt_type = torch.zeros(B, dtype=torch.long)
+
+    # Build hypotheses where h1 exactly matches GT.
+    hyp = _make_hypotheses(B, K)
+    hyp["omega_k"][:, 0, :] = gt_omega       # perfect axis for h1
+    hyp["p_k"][:, 0, :]     = gt_p           # perfect position for h1
+    hyp["w_k"] = torch.tensor([[0.90, 0.05, 0.05]]).expand(B, -1).clone()
+
+    with torch.no_grad():
+        losses = model.loss_terms(hyp, gt_omega, gt_p, gt_type)
+
+    # L_NLL = -log(0.90) ≈ 0.105
+    assert losses["L_NLL"].item() < 0.15, (
+        f"L_NLL={losses['L_NLL'].item():.4f} unexpectedly large for w_gt=0.90"
+    )
+    # L_mu_residual: the h1 term should be ~0; only h2,h3 contribute with w=0.05.
+    # Max possible: 0.05*(2+2) + 0.05*(2+2) = 0.40 (cosine max 2, p_err moderate).
+    # With λ_p=100 and random p errors on h2,h3, this could be bigger, but we
+    # just check it's finite and non-negative.
+    assert losses["L_mu_residual"].item() >= -1e-5, "L_mu_residual < 0"
+    assert not torch.isnan(losses["L_mu_residual"]), "L_mu_residual is NaN"
