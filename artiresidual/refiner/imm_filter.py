@@ -238,30 +238,88 @@ class IMMArticulationRefiner(nn.Module):
     # -------------------------------------------------------------------------
 
     def init_hypotheses(self, prior_output: dict) -> dict:
-        """Initialize K hypotheses from Module 01 prior estimator output.
+        """Initialize K=3 hypotheses from Module 01 prior estimator output.
 
-        The top-scoring hypothesis from the prior gets weight 0.6; the remaining
-        K-1 hypotheses share 0.4 equally (= 0.2 each for K=3). Hypothesis axes
-        are initialized as:
-            h1 = top-1 from prior (vertical-axis revolute by default)
-            h2 = top-1 axis rotated 90° about z (horizontal-axis revolute)
-            h3 = same axis as h1 but prismatic
+        Fixed hypothesis structure (spec §3 Module 04, v1 — DO NOT change order):
+            h1 (index 0): revolute,  axis  = omega from prior  (nominally vertical)
+            h2 (index 1): revolute,  axis  = omega ⊥ prior     (nominally horizontal)
+            h3 (index 2): prismatic, axis  = omega from prior
+
+        Weight rule: the hypothesis whose joint-type matches the prior's
+        top-1 prediction receives 0.6; the remaining K-1 hypotheses each get
+        0.2, so weights always sum to 1.  Resolving ambiguity within the
+        revolute family (h1 vs h2) is left to the first ``step()`` call.
 
         Args:
             prior_output: dict from Module 01 (PriorArticulationEstimator):
-                - 'omega':      [B, 3]  predicted axis direction (unit).
+                - 'omega':      [B, 3]  predicted axis direction (need not be unit).
                 - 'p':          [B, 3]  predicted axis origin.
-                - 'joint_type': [B]     predicted joint type (long: 0=rev, 1=pris).
-                - 'confidence': [B]     confidence in the top-1 prediction.
+                - 'joint_type': [B]     predicted joint type long (0=rev, 1=pris).
+                - 'confidence': [B]     not used here; reserved for future weighting.
 
         Returns:
             hypotheses: dict with
-                - 'omega_k': [B, K, 3]  axis direction per hypothesis.
+                - 'omega_k': [B, K, 3]  unit axis per hypothesis.
                 - 'p_k':     [B, K, 3]  axis origin per hypothesis.
                 - 'type_k':  [B, K]     long: 0=revolute, 1=prismatic.
-                - 'w_k':     [B, K]     weights summing to 1; top gets 0.6.
+                - 'w_k':     [B, K]     non-negative, sum to 1 per sample.
         """
-        raise NotImplementedError
+        if self.K != 3:
+            raise ValueError(
+                f"init_hypotheses is hardcoded for K=3; got self.K={self.K}. "
+                "The three hypothesis types (rev-vertical, rev-horizontal, prismatic) "
+                "are a v1 design constant (spec §3 Module 04)."
+            )
+
+        omega = prior_output["omega"]          # [B, 3]
+        p = prior_output["p"]                  # [B, 3]
+        joint_type = prior_output["joint_type"]  # [B] long
+
+        B = omega.shape[0]
+        device = omega.device
+        dtype = omega.dtype
+
+        # Normalize prior axis.
+        omega_unit = omega / omega.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, 3]
+
+        # h2 axis: any unit vector perpendicular to omega_unit.
+        # Use cross(omega, z_hat) with a y_hat fallback when omega ≈ ±z.
+        z_hat = omega_unit.new_zeros(B, 3); z_hat[:, 2] = 1.0  # [B, 3]
+        perp = torch.linalg.cross(omega_unit, z_hat, dim=-1)    # [B, 3]
+        near_z = perp.norm(dim=-1, keepdim=True) < 0.1          # [B, 1] bool
+
+        y_hat = omega_unit.new_zeros(B, 3); y_hat[:, 1] = 1.0   # [B, 3]
+        perp_y = torch.linalg.cross(omega_unit, y_hat, dim=-1)  # [B, 3]
+
+        perp = torch.where(near_z, perp_y, perp)                # [B, 3]
+        omega2 = perp / perp.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, 3] unit
+
+        # Stack K=3 hypothesis axes; clone so returned tensors own their storage.
+        omega_k = torch.stack([omega_unit, omega2, omega_unit], dim=1)  # [B, K, 3]
+        p_k = p.unsqueeze(1).expand(-1, self.K, -1).clone()             # [B, K, 3]
+
+        # Fixed type assignment: h1=revolute, h2=revolute, h3=prismatic.
+        type_k = torch.zeros(B, self.K, dtype=torch.long, device=device)
+        type_k[:, 2] = JOINT_TYPE_PRISMATIC
+
+        # Weight assignment: hypothesis matching prior's type gets 0.6; others 0.2.
+        # Revolute prior → top index 0 (h1).  Prismatic prior → top index 2 (h3).
+        is_revolute = joint_type == JOINT_TYPE_REVOLUTE  # [B] bool
+        top_idx = torch.where(
+            is_revolute,
+            torch.zeros(B, dtype=torch.long, device=device),    # h1
+            torch.full((B,), 2, dtype=torch.long, device=device),  # h3
+        )  # [B]
+
+        w_k = torch.full((B, self.K), 0.2, dtype=dtype, device=device)
+        w_k.scatter_(1, top_idx.unsqueeze(1), 0.6)  # top hypothesis → 0.6
+
+        return {
+            "omega_k": omega_k,  # [B, K, 3]
+            "p_k": p_k,          # [B, K, 3]
+            "type_k": type_k,    # [B, K] long
+            "w_k": w_k,          # [B, K] sums to 1.0 per sample
+        }
 
     def step(
         self,
