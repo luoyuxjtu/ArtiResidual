@@ -70,6 +70,10 @@ First version had unanchored `data/`, which silently matched `artiresidual/data/
 
 Spec §3 Module 06 says "no autograd needed". Implementation still uses torch ops because they broadcast cleanly, stay on the caller's device, and incidentally support autograd if the caller wants it (the IMM refiner detaches in practice). A numpy-only rewrite would be a downgrade for negligible benefit.  · spec §3 Module 06
 
+## 2026-05-14  ·  `step()` uses `renormalize_with_floor` instead of spec §4.3's naive clamp+normalize
+
+Spec §4.3 says: `w_new = max(w_k * exp(ℓ_k), w_min)`, then divide by sum. The naive "clamp then divide" does NOT guarantee `min(w_new) ≥ w_min` after the division — e.g. `w_unnorm = [10, 0.03, 0.03]` → after clamp `[10, 0.05, 0.05]` → after normalize `[0.990, 0.00495, 0.00495]`, violating the floor. `renormalize_with_floor` (already implemented in `affordance_utils.py`) uses the formula `w_out[k] = w_min + (1 - K·w_min) · proportion[k]` which is mathematically guaranteed to satisfy both `min ≥ w_min` and `sum = 1`. This is a strict improvement over the spec formulation for the same qualitative behavior (floor + renormalize). The qualitative spec intent is preserved; we deviate only in the mechanics of how the floor is enforced.  · spec §4.3
+
 ## 2026-05-14  ·  SAM2PartTracker frame convention: camera-frame output; cam→world is the caller's responsibility
 
 Option B selected: `SAM2PartTracker.estimate()` API is unchanged — it returns poses in the **camera frame** and accepts no extrinsics. The caller must apply the cam→world transform before passing poses to Module 04 or Module 06. Canonical helper: `artiresidual.utils.geometry.transform_poses(poses, cam_to_world)` which applies a [4, 4] rigid transform to a [..., 7] pose batch. Module 04 `step()` documents this obligation explicitly ("all part poses in `window` must be in world frame"). Rationale: keeps SAM2PartTracker's API minimal and makes the frame obligation loud at the call site. The tracker can be extended to accept extrinsics later without a breaking API change.  · spec §3.0 (spec is silent on frame convention)

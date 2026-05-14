@@ -96,6 +96,66 @@ class _PointNetMini(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Batched geometry helpers (module-private, used only by step())
+# ---------------------------------------------------------------------------
+
+
+def _batched_clip_norm(v: Tensor, max_norm: float, eps: float = 1e-8) -> Tensor:
+    """Clip each vector in a batch so its L² norm ≤ max_norm.
+
+    Works on any leading batch shape [..., 3].
+    Vectors already within the bound are returned unchanged (no scaling).
+
+    Args:
+        v: [..., 3] batch of vectors.
+        max_norm: maximum allowed norm.
+        eps: numerical floor on computed norm.
+
+    Returns:
+        [..., 3] clipped batch, with ‖v[...]‖ ≤ max_norm.
+    """
+    norm = v.norm(dim=-1, keepdim=True).clamp(min=eps)  # [..., 1]
+    scale = (max_norm / norm).clamp(max=1.0)            # [..., 1] ≤ 1
+    return v * scale
+
+
+def _batched_exp_map_sphere(
+    omega: Tensor, delta: Tensor, eps: float = 1e-8
+) -> Tensor:
+    """Batched exponential map on S² (spec §4.4 formula, vectorized).
+
+    Given current axes ``omega`` ∈ S² and tangent corrections ``delta``,
+    returns the rotated axes ``omega_new`` ∈ S².  The formula is:
+
+        δ_tan = delta − (delta · ω̂) ω̂          # project onto tangent plane
+        ω_new = ω̂ cos(‖δ_tan‖) + (δ_tan/‖δ_tan‖) sin(‖δ_tan‖)
+
+    ``delta`` need not be pre-projected onto the tangent plane; the parallel
+    component is removed here.  The output is renormalized defensively.
+
+    Args:
+        omega: [..., 3] current unit axes on S² (will be renormalized).
+        delta: [..., 3] tangent-space corrections (already clipped to cone).
+        eps: numerical floor.
+
+    Returns:
+        [..., 3] updated unit axes on S².
+    """
+    omega_unit = omega / omega.norm(dim=-1, keepdim=True).clamp(min=eps)
+
+    # Project delta onto the tangent plane at omega (remove parallel component).
+    dot = (delta * omega_unit).sum(dim=-1, keepdim=True)  # [..., 1]
+    tangent = delta - dot * omega_unit                     # [..., 3]  ⊥ omega
+
+    angle = tangent.norm(dim=-1, keepdim=True).clamp(min=eps)  # [..., 1]
+    direction = tangent / angle                                 # [..., 3] unit
+
+    # Rodrigues: rotate omega toward direction by angle radians.
+    omega_new = torch.cos(angle) * omega_unit + torch.sin(angle) * direction
+    return omega_new / omega_new.norm(dim=-1, keepdim=True).clamp(min=eps)
+
+
+# ---------------------------------------------------------------------------
 # Main module
 # ---------------------------------------------------------------------------
 
@@ -139,9 +199,10 @@ class IMMArticulationRefiner(nn.Module):
         self.p_clip_m: float = float(config.p_clip_m)        # 5 cm
         self.lambda_H: float = float(config.lambda_H)        # entropy regularization weight
 
-        dim: int = int(config.dim)         # 256 — transformer model width
-        n_heads: int = int(config.n_heads) # 4
-        n_layers: int = int(config.n_layers)  # 4
+        dim: int = int(config.dim)            # 256 — transformer model width
+        n_heads: int = int(config.n_heads)   # 4
+        n_layers: int = int(config.n_layers) # 4
+        self.dim: int = dim                   # stored for use in step()
 
         # --- Per-step flow encoder (PointNet-mini, shared across K and T) ----
         # Encodes the per-point flow residual Δ_flow_k = f_pred - f_ana(hyp_k)
@@ -364,7 +425,82 @@ class IMMArticulationRefiner(nn.Module):
             hypotheses_new: dict with same keys as ``hypotheses``;
                 (omega_k, p_k, w_k) updated; type_k unchanged.
         """
-        raise NotImplementedError
+        omega_k = hypotheses["omega_k"]      # [B, K, 3]
+        p_k     = hypotheses["p_k"]          # [B, K, 3]
+        type_k  = hypotheses["type_k"]       # [B, K] long — never mutated
+        w_k     = hypotheses["w_k"]          # [B, K]
+
+        delta_flow_k = window["delta_flow_k"]  # [B, K, T, N, 3]
+        wrench       = window["wrench"]         # [B, T, 12]
+        wrench_res_k = window["wrench_res_k"]  # [B, K, T, 3]
+        action       = window["action"]         # [B, T, 14]
+
+        B, K, T, N, _ = delta_flow_k.shape
+
+        # ── 1. Per-step feature encoding ──────────────────────────────────────
+        # Flow residual: PointNet-mini per (batch, hypothesis, step).
+        # [B, K, T, N, 3] → [B*K*T, N, 3] → [B*K*T, dim]
+        flow_feat = self.flow_encoder(
+            delta_flow_k.reshape(B * K * T, N, 3)
+        )  # [B*K*T, dim]
+
+        # Wrench + per-hypothesis wrench residual.
+        # wrench [B, T, 12] → broadcast over K → [B, K, T, 12] → [B*K*T, 12]
+        wrench_bkt = wrench.unsqueeze(1).expand(-1, K, -1, -1).reshape(B * K * T, 12)
+        wrench_res = wrench_res_k.reshape(B * K * T, 3)
+        wrench_feat = self.wrench_mlp(
+            torch.cat([wrench_bkt, wrench_res], dim=-1)
+        )  # [B*K*T, 64]
+
+        # Action: [B, T, 14] → broadcast over K → [B*K*T, 14] → [B*K*T, 64]
+        action_feat = self.action_mlp(
+            action.unsqueeze(1).expand(-1, K, -1, -1).reshape(B * K * T, 14)
+        )  # [B*K*T, 64]
+
+        # Concat (dim+64+64=384) → step_proj → dim; reshape for transformer.
+        step_tokens = self.step_proj(
+            torch.cat([flow_feat, wrench_feat, action_feat], dim=-1)
+        ).reshape(B * K, T, self.dim)  # [B*K, T, dim]
+
+        # ── 2. Per-hypothesis transformer encoder → mean-pool → [B, K, dim] ──
+        # Shared weights across K: all K hypotheses pass through the same net.
+        hyp_tokens = self.hyp_encoder(step_tokens).mean(dim=1)  # [B*K, dim]
+        hyp_tokens = hyp_tokens.reshape(B, K, self.dim)          # [B, K, dim]
+
+        # ── 3. Cross-hypothesis attention (IMM mode-mixing) ───────────────────
+        hyp_tokens = self.cross_hyp_attn(hyp_tokens)  # [B, K, dim]
+
+        # ── 4a. Weight update (spec §4.3) ─────────────────────────────────────
+        # ℓ_k = NeuralLogLikelihood(window, hyp_k) from ll_head.
+        ll = self.ll_head(hyp_tokens).squeeze(-1)  # [B, K] log-likelihood scores
+        w_unnorm = w_k * torch.exp(ll)             # [B, K] unnorm. posterior
+        # renormalize_with_floor guarantees min weight ≥ w_min after renorm.
+        # (The spec's naive clamp+divide can violate the floor — see DECISIONS.md.)
+        w_new = renormalize_with_floor(w_unnorm, w_min=self.w_min)  # [B, K]
+
+        # ── 4b. Tangent-space residual application (spec §4.4) ────────────────
+        delta_mu = self.residual_head(hyp_tokens)  # [B, K, 6]
+        d_omega  = delta_mu[..., :3]               # [B, K, 3]  tangent correction for ω
+        d_p      = delta_mu[..., 3:]               # [B, K, 3]  position correction for p
+
+        # ω: scale by η → clip to 30° cone → exp-map back onto S².
+        d_omega_clipped = _batched_clip_norm(
+            self.eta * d_omega, self.omega_clip_rad
+        )  # [B, K, 3], ‖·‖ ≤ 0.524 rad
+        omega_new = _batched_exp_map_sphere(omega_k, d_omega_clipped)  # [B, K, 3]
+
+        # p: scale by η → clip to 5 cm → translate.
+        d_p_clipped = _batched_clip_norm(
+            self.eta * d_p, self.p_clip_m
+        )  # [B, K, 3], ‖·‖ ≤ 0.05 m
+        p_new = p_k + d_p_clipped  # [B, K, 3]
+
+        return {
+            "omega_k": omega_new,  # [B, K, 3] unit vectors on S²
+            "p_k":     p_new,      # [B, K, 3]
+            "type_k":  type_k,     # [B, K] long — unchanged (v1 invariant)
+            "w_k":     w_new,      # [B, K] ≥ w_min, sums to 1
+        }
 
     def get_f_cond(
         self,
