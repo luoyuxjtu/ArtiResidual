@@ -6,6 +6,14 @@ The point of this log is so that *future me* (and reviewers) can answer "why did
 
 ---
 
+## 2026-05-14  ·  End-to-end angle error threshold: 1°
+
+Established by running `scripts/e2e_test_state_estimator.py` at σ ∈ {0, 2, 5, 10} mm door-depth noise. At σ=10 mm (far beyond L515 spec of ~1–2 mm) max |err| = 0.831° < 1°. Adopting 1° as the acceptance threshold for the full SAM2PartTracker → JointStateEstimator chain, consistent with the Module 06 unit-test spec bound.  · spec §3 Module 06 + §3.0
+
+## 2026-05-14  ·  `setup_sam2.sh` installs SAM2 with `--no-deps` to pin torch cu121
+
+SAM2 declares `torch>=2.5.1`; a plain `pip install -e sam2` upgraded torch to 2.11+cu130, which broke CUDA on the server's driver-12.8. Fixed by installing SAM2 with `--no-deps` and listing its non-torch deps (`iopath`, `hydra-core`, `tqdm`) explicitly. Torch stays at 2.4.0+cu121.  · n/a (operational)
+
 ## 2026-05-13  ·  Quaternion convention: scalar-first `(w, x, y, z)`
 
 Used in `artiresidual/refiner/state_estimator.py` and `artiresidual/utils/part_tracker.py`. Matches PyTorch3D / mujoco / the ML stack we're already on; documented in both module docstrings. The spec doesn't fix this — we did.  · spec §2 silent on quat order
