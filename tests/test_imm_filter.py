@@ -279,3 +279,165 @@ def test_step_batch_size_invariant(
     assert out["w_k"].shape == (B, K)
     assert not torch.isnan(out["omega_k"]).any()
     assert not torch.isnan(out["w_k"]).any()
+
+
+# ---------------------------------------------------------------------------
+# get_f_cond() — belief-weighted flow + entropy (spec §4.5 + §4.6)
+# ---------------------------------------------------------------------------
+
+
+def test_get_f_cond_output_shapes(model: IMMArticulationRefiner) -> None:
+    """Returned f_cond is [B, N, 3] and entropy is [B]."""
+    B, K, N = 4, _CFG.K, 128
+    hyp = _make_hypotheses(B, K)
+    theta_t = torch.rand(B) * math.pi
+    pcd = torch.randn(B, N, 3)
+
+    with torch.no_grad():
+        f_cond, entropy = model.get_f_cond(hyp, theta_t, pcd)
+
+    assert f_cond.shape == (B, N, 3), f"f_cond shape: {f_cond.shape}"
+    assert entropy.shape == (B,),     f"entropy shape: {entropy.shape}"
+    assert not torch.isnan(f_cond).any() and not torch.isinf(f_cond).any()
+    assert not torch.isnan(entropy).any() and not torch.isinf(entropy).any()
+
+
+def test_get_f_cond_entropy_bounds(model: IMMArticulationRefiner) -> None:
+    """For K=3 with w_min=0.05, entropy is in [H_min, log(K)]."""
+    B, K, N = 8, _CFG.K, 64
+    hyp = _make_hypotheses(B, K)
+    pcd = torch.randn(B, N, 3)
+
+    with torch.no_grad():
+        _, entropy = model.get_f_cond(hyp, torch.zeros(B), pcd)
+
+    # H ∈ [0, log K] always.
+    assert (entropy >= 0).all(), f"negative entropy: {entropy}"
+    assert (entropy <= math.log(K) + 1e-5).all(), \
+        f"entropy > log(K)={math.log(K):.4f}: max={entropy.max():.4f}"
+
+
+def test_get_f_cond_uniform_weights_max_entropy(
+    model: IMMArticulationRefiner,
+) -> None:
+    """Uniform weights yield entropy = log(K)."""
+    B, K, N = 4, _CFG.K, 64
+    hyp = _make_hypotheses(B, K)
+    hyp["w_k"] = torch.full((B, K), 1.0 / K)  # exactly uniform
+
+    with torch.no_grad():
+        _, entropy = model.get_f_cond(hyp, torch.zeros(B), torch.randn(B, N, 3))
+
+    expected = math.log(K)
+    assert torch.allclose(entropy, torch.full((B,), expected), atol=1e-5), (
+        f"uniform-weight entropy {entropy[0].item():.5f} ≠ log(K)={expected:.5f}"
+    )
+
+
+def test_get_f_cond_belief_weighted_sum_correctness(
+    model: IMMArticulationRefiner,
+) -> None:
+    """When one hypothesis has weight ≈ 1, f_cond ≈ that hypothesis's flow."""
+    B, K, N = 2, _CFG.K, 64
+    hyp = _make_hypotheses(B, K)
+    # Force a near-degenerate weight (respecting the floor): h1 dominates.
+    hyp["w_k"] = torch.tensor([[0.90, 0.05, 0.05]]).expand(B, -1).clone()
+    pcd = torch.randn(B, N, 3)
+
+    with torch.no_grad():
+        f_cond, _ = model.get_f_cond(hyp, torch.zeros(B), pcd)
+
+    # f_cond should be dominated by h1's revolute flow at norm scale ~ 0.90
+    # (since per-hypothesis max-norm = 1 and mixing weights to 0.90 / 0.05 / 0.05).
+    max_norm = f_cond.norm(dim=-1).max().item()
+    assert max_norm <= 1.0 + 1e-5, (
+        f"f_cond max norm {max_norm:.4f} > 1.0 (sum of w_k caps at sum(w_k)=1)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Integration test — full pipeline: init → 30 control steps → get_f_cond
+# ---------------------------------------------------------------------------
+
+
+def test_integration_30_control_steps(
+    model: IMMArticulationRefiner,
+) -> None:
+    """Simulate a 30-step rollout: step() every N=10 steps + final get_f_cond().
+
+    Verifies the full forward pipeline:
+        init_hypotheses → [step] × 3 → get_f_cond
+    and checks all returned shapes plus the standard invariants at each
+    intermediate stage.
+    """
+    B, K, T, N = 2, _CFG.K, _CFG.window_T, 64
+    n_control_steps = 30
+    n_interval = _CFG.update_interval_N  # 10
+
+    # 1. Initialize hypotheses from a mock Module 01 prior output.
+    #    Mix of revolute/prismatic priors to exercise both weight paths.
+    prior_output = {
+        "omega":      torch.randn(B, 3),
+        "p":          torch.randn(B, 3) * 0.5,
+        "joint_type": torch.tensor([0, 1], dtype=torch.long),  # revolute, prismatic
+        "confidence": torch.tensor([0.8, 0.7]),
+    }
+    hyp = model.init_hypotheses(prior_output)
+
+    assert hyp["omega_k"].shape == (B, K, 3)
+    assert hyp["p_k"].shape     == (B, K, 3)
+    assert hyp["type_k"].shape  == (B, K)
+    assert hyp["w_k"].shape     == (B, K)
+
+    # Revolute prior → h1 = 0.6;  prismatic prior → h3 = 0.6.
+    assert hyp["w_k"][0, 0].item() == pytest.approx(0.6, abs=1e-5)
+    assert hyp["w_k"][1, 2].item() == pytest.approx(0.6, abs=1e-5)
+
+    # 2. Simulate 30 control steps; call step() every 10 (= 3 times).
+    n_step_calls = 0
+    for t in range(n_control_steps):
+        if (t + 1) % n_interval == 0:
+            # Build evidence window from accumulated observations (here: dummy).
+            window = _make_window(B, K, T, N)
+            with torch.no_grad():
+                hyp = model.step(hyp, window)
+            n_step_calls += 1
+
+            # Shape preservation
+            assert hyp["omega_k"].shape == (B, K, 3)
+            assert hyp["p_k"].shape     == (B, K, 3)
+            assert hyp["type_k"].shape  == (B, K)
+            assert hyp["w_k"].shape     == (B, K)
+
+            # Invariants
+            norms_dev = (hyp["omega_k"].norm(dim=-1) - 1.0).abs().max().item()
+            assert norms_dev < 1e-4, \
+                f"step #{n_step_calls}: ω not unit (max dev {norms_dev:.2e})"
+
+            w_sum_err = (hyp["w_k"].sum(dim=-1) - 1.0).abs().max().item()
+            assert w_sum_err < 1e-4, \
+                f"step #{n_step_calls}: weights don't sum to 1 (err {w_sum_err:.2e})"
+
+            min_w = hyp["w_k"].min().item()
+            assert min_w >= _CFG.w_min - 1e-5, \
+                f"step #{n_step_calls}: weight floor violated (min={min_w:.4f})"
+
+    assert n_step_calls == 3, \
+        f"Expected 3 step() calls in {n_control_steps} steps " \
+        f"with N={n_interval}, got {n_step_calls}"
+
+    # 3. Final get_f_cond() — produces conditioning for the DiT policy.
+    theta_t = torch.rand(B) * math.pi          # arbitrary current joint config
+    pcd     = torch.randn(B, N, 3)             # current scene point cloud
+    with torch.no_grad():
+        f_cond, entropy = model.get_f_cond(hyp, theta_t, pcd)
+
+    assert f_cond.shape == (B, N, 3), f"f_cond shape: {f_cond.shape}"
+    assert entropy.shape == (B,),     f"entropy shape: {entropy.shape}"
+
+    assert not torch.isnan(f_cond).any() and not torch.isinf(f_cond).any()
+    assert not torch.isnan(entropy).any() and not torch.isinf(entropy).any()
+
+    # Entropy is still in valid bounds after 3 step() refinements.
+    assert (entropy >= 0).all()
+    assert (entropy <= math.log(K) + 1e-5).all()

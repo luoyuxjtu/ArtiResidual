@@ -40,17 +40,13 @@ import torch.nn as nn
 from torch import Tensor
 
 from artiresidual.refiner.affordance_utils import (
-    clip_axis_correction,
-    clip_position_correction,
-    exp_map_sphere,
     hypothesis_entropy,
     renormalize_with_floor,
 )
 from artiresidual.refiner.analytical_flow import (
+    JOINT_TYPE_FIXED,
     JOINT_TYPE_PRISMATIC,
     JOINT_TYPE_REVOLUTE,
-    analytical_flow_batched,
-    belief_weighted_flow,
 )
 
 __all__ = ["IMMArticulationRefiner"]
@@ -528,8 +524,63 @@ class IMMArticulationRefiner(nn.Module):
                                 Injected as the DiT policy's "entropy token"
                                 (cross-attention 2) so the policy knows how
                                 uncertain the current belief is.
+
+        Notes:
+            - ``theta_t`` is accepted for API compatibility with spec §3 Module 04
+              but is not used in the per-part-normalized flow computation (per-part
+              max-norm normalization absorbs the δθ scalar factor — see
+              ``analytical_flow.belief_weighted_flow`` docstring for context).
+            - Per-hypothesis flows are max-norm-normalized **before** the belief
+              weighting; the mixed result is **not** re-normalized so low-weight
+              hypotheses contribute proportionally less (FlowBot3D convention).
         """
-        raise NotImplementedError
+        omega_k = hypotheses["omega_k"]  # [B, K, 3]
+        p_k     = hypotheses["p_k"]      # [B, K, 3]
+        type_k  = hypotheses["type_k"]   # [B, K] long
+        w_k     = hypotheses["w_k"]      # [B, K]
+
+        del theta_t  # accepted for API compat; see Notes above.
+
+        B, K, _ = omega_k.shape
+        N = pcd.shape[1]
+
+        # Normalize hypothesis axes onto S² (defensive — step() already does this).
+        omega_unit = omega_k / omega_k.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        # [B, K, 3]
+
+        # Revolute flow:  f_rev[b, k, n, :] = ω[b, k] × (pcd[b, n] − p[b, k])
+        # Build rel[b, k, n, :] via broadcast:  [B, 1, N, 3] − [B, K, 1, 3] = [B, K, N, 3]
+        rel = pcd.unsqueeze(1) - p_k.unsqueeze(2)              # [B, K, N, 3]
+        omega_bcast = omega_unit.unsqueeze(2).expand(B, K, N, 3)  # [B, K, N, 3]
+        f_rev = torch.linalg.cross(omega_bcast, rel, dim=-1)   # [B, K, N, 3]
+
+        # Prismatic flow: constant ω over N (broadcast).
+        f_pri = omega_bcast                                     # [B, K, N, 3]
+
+        # Per-(b,k) type selection.  Use unsqueeze to align with [B, K, N, 3].
+        is_rev = (type_k == JOINT_TYPE_REVOLUTE).unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+        flows = torch.where(is_rev, f_rev, f_pri)               # [B, K, N, 3]
+
+        # FIXED (if any) → zero flow.  In v1 this branch is unused because
+        # init_hypotheses only emits REVOLUTE / PRISMATIC, but the guard makes
+        # the function robust to externally-constructed hypothesis dicts.
+        is_fix = (type_k == JOINT_TYPE_FIXED).unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+        flows = torch.where(is_fix, torch.zeros_like(flows), flows)
+
+        # Per-hypothesis max-norm normalization (FlowBot3D convention).
+        # Each (b, k) slice is scaled so that max_n ‖f[b, k, n, :]‖ = 1.
+        max_norm = flows.norm(dim=-1).amax(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, K, 1]
+        flows = flows / max_norm.unsqueeze(-1)                  # [B, K, N, 3]
+
+        # Belief-weighted sum (spec §4.5).  Broadcast w_k to [B, K, 1, 1].
+        f_cond = (w_k.unsqueeze(-1).unsqueeze(-1) * flows).sum(dim=1)  # [B, N, 3]
+
+        # Entropy (spec §4.6).  ``hypothesis_entropy`` clamps weights at eps before
+        # log, which is equivalent to the spec's log(w + ε) up to the constant
+        # offset of log(1/(1+Kε)) ≈ 0.
+        entropy = hypothesis_entropy(w_k)  # [B]
+
+        return f_cond, entropy
 
     def loss_terms(
         self,
